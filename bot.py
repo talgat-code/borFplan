@@ -19,6 +19,10 @@ from telegram.ext import (
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "planbot.db"
+MEDIA_DIR = BASE_DIR / "media"
+PHOTO_ADD = MEDIA_DIR / "add.jpg"
+PHOTO_DONE = MEDIA_DIR / "done.jpg"
+PHOTO_DELETE = MEDIA_DIR / "delete.jpg"
 TZ_NAME = os.environ.get("PLANBOT_TZ", "Asia/Almaty")
 TZ = ZoneInfo(TZ_NAME)
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -192,6 +196,25 @@ def parse_date_only(s: str):
 
 PRIO_ICONS = {0: "▫️", 1: "🟡", 2: "🔴"}
 PRIO_NAMES = {0: "обычная", 1: "важно", 2: "срочно"}
+
+
+async def send_reaction(bot, chat_id: int, photo_path: Path, caption: str):
+    """Send a photo reaction with caption; fall back to text if photo missing."""
+    if photo_path.exists():
+        try:
+            with open(photo_path, "rb") as f:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=f,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+            return
+        except Exception as e:
+            log.warning("send_photo %s failed: %s", photo_path, e)
+    await bot.send_message(
+        chat_id=chat_id, text=caption, parse_mode=ParseMode.HTML
+    )
 
 
 def extract_priority(text: str):
@@ -442,11 +465,21 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("ID должен быть числом")
         return
-    if not db_get_task(tid, update.effective_user.id):
+    row = db_get_task(tid, update.effective_user.id)
+    if not row:
         await update.message.reply_text("Такой задачи нет")
         return
+    was_done = bool(row["done"])
     db_toggle_done(tid, update.effective_user.id)
-    await update.message.reply_text(f"Переключил статус #{tid}")
+    if not was_done:
+        await send_reaction(
+            context.bot, update.effective_chat.id, PHOTO_DONE,
+            f"<b>Молодец!</b> 💪\nЗадача <b>#{tid}</b> выполнена:\n<i>{row['text']}</i>",
+        )
+    else:
+        await update.message.reply_html(
+            f"Вернул #{tid} в работу:\n<i>{row['text']}</i>"
+        )
 
 
 async def cmd_prio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,10 +524,17 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("ID должен быть числом")
         return
+    row = db_get_task(tid, update.effective_user.id)
     db_delete_task(tid, update.effective_user.id)
     for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
         job.schedule_removal()
-    await update.message.reply_text(f"Удалил #{tid}")
+    if row:
+        await send_reaction(
+            context.bot, update.effective_chat.id, PHOTO_DELETE,
+            f"<b>ОКЕЙ</b>\nУдалил <b>#{tid}</b>:\n<i>{row['text']}</i>",
+        )
+    else:
+        await update.message.reply_text(f"Удалил #{tid}")
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -510,13 +550,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = q.from_user.id
 
+    reaction = None  # (photo_path, caption) to send after refresh
+    chat_id = q.message.chat_id if q.message else None
+
     if action == "done":
-        if db_get_task(tid, user_id):
+        row = db_get_task(tid, user_id)
+        if row:
+            was_done = bool(row["done"])
             db_toggle_done(tid, user_id)
+            if not was_done and chat_id is not None:
+                reaction = (
+                    PHOTO_DONE,
+                    f"<b>Молодец!</b> 💪\nЗадача <b>#{tid}</b> выполнена:\n<i>{row['text']}</i>",
+                )
     elif action == "del":
+        row = db_get_task(tid, user_id)
         db_delete_task(tid, user_id)
         for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
             job.schedule_removal()
+        if row and chat_id is not None:
+            reaction = (
+                PHOTO_DELETE,
+                f"<b>ОКЕЙ</b>\nУдалил <b>#{tid}</b>:\n<i>{row['text']}</i>",
+            )
     elif action == "prio":
         row = db_get_task(tid, user_id)
         if row:
@@ -529,6 +585,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
         log.debug("edit_message_text failed: %s", e)
+
+    if reaction and chat_id is not None:
+        photo_path, caption = reaction
+        await send_reaction(context.bot, chat_id, photo_path, caption)
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -614,9 +674,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prio_label = ""
     if prio:
         prio_label = f" {PRIO_ICONS[prio]} <i>({PRIO_NAMES[prio]})</i>"
-    await update.message.reply_html(
+    caption = (
+        f"<b>Умничка!</b> 🎉\n"
         f"Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{txt}</i>{tail}"
     )
+    await send_reaction(context.bot, update.effective_chat.id, PHOTO_ADD, caption)
 
 
 async def restore_reminders(app: Application):
