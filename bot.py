@@ -22,12 +22,6 @@ DB_PATH = BASE_DIR / "planbot.db"
 TZ_NAME = os.environ.get("PLANBOT_TZ", "Asia/Almaty")
 TZ = ZoneInfo(TZ_NAME)
 TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit(
-        "BOT_TOKEN env var not set. Get a token from @BotFather and run:\n"
-        '  PowerShell: $env:BOT_TOKEN = "123456:ABC..."; python bot.py\n'
-        '  cmd.exe:    set BOT_TOKEN=123456:ABC... && python bot.py'
-    )
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -56,50 +50,66 @@ def db_init():
                 remind_at TEXT,
                 text TEXT NOT NULL,
                 done INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_user_date ON tasks(user_id, task_date);
             CREATE INDEX IF NOT EXISTS idx_remind ON tasks(remind_at);
             """
         )
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "priority" not in cols:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+            )
 
 
-def db_add_task(user_id, chat_id, task_date, text, remind_at=None):
+def db_add_task(user_id, chat_id, task_date, text, remind_at=None, priority=0):
     with db_connect() as conn:
         cur = conn.execute(
-            "INSERT INTO tasks (user_id, chat_id, task_date, remind_at, text, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (user_id, chat_id, task_date, remind_at, text, priority, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 chat_id,
                 task_date.isoformat(),
                 remind_at.isoformat() if remind_at else None,
                 text,
+                priority,
                 datetime.now(TZ).isoformat(),
             ),
         )
         return cur.lastrowid
 
 
+def db_set_priority(task_id, user_id, priority):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET priority = ? WHERE id = ? AND user_id = ?",
+            (priority, task_id, user_id),
+        )
+
+
 def db_list_tasks(user_id, day=None, days_ahead=None):
     with db_connect() as conn:
+        order = "done, priority DESC, remind_at IS NULL, remind_at, id"
         if day is not None:
             return conn.execute(
-                "SELECT * FROM tasks WHERE user_id = ? AND task_date = ? "
-                "ORDER BY done, remind_at IS NULL, remind_at, id",
+                f"SELECT * FROM tasks WHERE user_id = ? AND task_date = ? "
+                f"ORDER BY {order}",
                 (user_id, day.isoformat()),
             ).fetchall()
         today = datetime.now(TZ).date()
         if days_ahead is not None:
             end = today + timedelta(days=days_ahead)
             return conn.execute(
-                "SELECT * FROM tasks WHERE user_id = ? AND task_date BETWEEN ? AND ? "
-                "ORDER BY task_date, done, remind_at IS NULL, remind_at, id",
+                f"SELECT * FROM tasks WHERE user_id = ? AND task_date BETWEEN ? AND ? "
+                f"ORDER BY task_date, {order}",
                 (user_id, today.isoformat(), end.isoformat()),
             ).fetchall()
         return conn.execute(
-            "SELECT * FROM tasks WHERE user_id = ? AND task_date >= ? "
-            "ORDER BY task_date, done, remind_at IS NULL, remind_at, id",
+            f"SELECT * FROM tasks WHERE user_id = ? AND task_date >= ? "
+            f"ORDER BY task_date, {order}",
             (user_id, today.isoformat()),
         ).fetchall()
 
@@ -178,6 +188,24 @@ def parse_date_only(s: str):
         except ValueError:
             return None
     return None
+
+
+PRIO_ICONS = {0: "▫️", 1: "🟡", 2: "🔴"}
+PRIO_NAMES = {0: "обычная", 1: "важно", 2: "срочно"}
+
+
+def extract_priority(text: str):
+    """Pull standalone !/!! tokens out of text → (priority, cleaned)."""
+    prio = 0
+
+    def repl(m):
+        nonlocal prio
+        prio = max(prio, min(2, len(m.group(1))))
+        return " "
+
+    cleaned = re.sub(r"(?:^|\s)(!{1,3})(?=\s|$)", repl, text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return prio, cleaned
 
 
 def parse_input(text: str):
@@ -260,7 +288,10 @@ def fmt_date(d: date) -> str:
 
 
 def task_line(row) -> str:
-    mark = "✅" if row["done"] else "▫️"
+    if row["done"]:
+        mark = "✅"
+    else:
+        mark = PRIO_ICONS.get(row["priority"], "▫️")
     suffix = ""
     if row["remind_at"]:
         try:
@@ -275,10 +306,15 @@ def tasks_keyboard(rows, view: str):
     kb = []
     for r in rows:
         flip = "↩️" if r["done"] else "✅"
+        prio_icon = PRIO_ICONS.get(r["priority"], "▫️")
         kb.append([
             InlineKeyboardButton(
                 f"{flip} #{r['id']}",
                 callback_data=f"done:{r['id']}:{view}",
+            ),
+            InlineKeyboardButton(
+                f"{prio_icon} #{r['id']}",
+                callback_data=f"prio:{r['id']}:{view}",
             ),
             InlineKeyboardButton(
                 f"🗑 #{r['id']}",
@@ -333,19 +369,22 @@ HELP = (
     "• <code>сегодня позвонить маме</code>\n"
     "• <code>завтра в 09:00 утренняя пробежка</code>\n"
     "• <code>25.05 купить молоко</code>\n"
-    "• <code>25.05.2026 14:30 встреча с командой</code>\n"
-    "• <code>2026-05-25 сдать отчёт</code>\n\n"
-    "Если указано время (<code>HH:MM</code>) — пришлю напоминание в это время.\n\n"
+    "• <code>25.05.2026 14:30 !! встреча с клиентом</code>\n"
+    "• <code>2026-05-25 ! сдать отчёт</code>\n\n"
+    "Если указано время (<code>HH:MM</code>) — пришлю напоминание.\n\n"
+    "<b>Приоритеты:</b> ▫️ обычная · 🟡 важно (<code>!</code>) · 🔴 срочно (<code>!!</code>).\n"
+    "В списке срочные идут первыми. Прио можно поставить и кнопкой 🟡/🔴 под задачей (она циклит).\n\n"
     "<b>Команды:</b>\n"
     "/today — дела на сегодня\n"
     "/tomorrow — на завтра\n"
     "/week — на ближайшие 7 дней\n"
     "/all — все будущие дела\n"
     "/day 25.05.2026 — на конкретную дату\n"
-    "/done 12 — переключить «сделано» для задачи #12\n"
+    "/done 12 — переключить «сделано» для #12\n"
+    "/prio 12 ! — задать приоритет (или 0/1/2)\n"
     "/del 12 — удалить задачу #12\n"
     "/help — эта подсказка\n\n"
-    "Под каждым списком — кнопки ✅/↩️ (готово / вернуть) и 🗑 (удалить)."
+    "Под списком кнопки: ✅/↩️ (готово/вернуть) · 🟡/🔴 (циклить приоритет) · 🗑 (удалить)."
 )
 
 
@@ -410,6 +449,39 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Переключил статус #{tid}")
 
 
+async def cmd_prio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /prio 12 <0|1|2>\n"
+            "  0 — обычная\n"
+            "  1 — важно 🟡 (можно «!» или «важно»)\n"
+            "  2 — срочно 🔴 (можно «!!» или «срочно»)"
+        )
+        return
+    try:
+        tid = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом")
+        return
+    raw = " ".join(context.args[1:]).strip().lower()
+    aliases = {
+        "0": 0, "обычная": 0, "обычный": 0, "обычно": 0, "norm": 0, "normal": 0,
+        "1": 1, "!": 1, "важно": 1, "важная": 1, "high": 1,
+        "2": 2, "!!": 2, "срочно": 2, "срочная": 2, "urgent": 2,
+    }
+    if raw not in aliases:
+        await update.message.reply_text("Не понял уровень. Используй 0, 1, 2 или !, !!")
+        return
+    if not db_get_task(tid, update.effective_user.id):
+        await update.message.reply_text("Такой задачи нет")
+        return
+    p = aliases[raw]
+    db_set_priority(tid, update.effective_user.id, p)
+    await update.message.reply_html(
+        f"#{tid} → {PRIO_ICONS[p]} <i>{PRIO_NAMES[p]}</i>"
+    )
+
+
 async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Использование: /del 12")
@@ -445,6 +517,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_delete_task(tid, user_id)
         for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
             job.schedule_removal()
+    elif action == "prio":
+        row = db_get_task(tid, user_id)
+        if row:
+            db_set_priority(tid, user_id, (row["priority"] + 1) % 3)
 
     rows, header = view_for(user_id, view)
     text = render_tasks(rows, header)
@@ -500,6 +576,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     d, t, txt = parsed
+    prio, txt = extract_priority(txt)
+    if not txt:
+        await update.message.reply_text("Пустой текст задачи. Добавь описание.")
+        return
     remind_at = None
     schedule = False
     if t is not None:
@@ -511,6 +591,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.effective_chat.id,
         d, txt,
         remind_at=remind_at,
+        priority=prio,
     )
 
     if schedule:
@@ -530,8 +611,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = "\n⏰ Напомню в указанное время."
     elif t and not schedule:
         tail = "\n⚠️ Время уже прошло — напоминание не ставлю."
+    prio_label = ""
+    if prio:
+        prio_label = f" {PRIO_ICONS[prio]} <i>({PRIO_NAMES[prio]})</i>"
     await update.message.reply_html(
-        f"Добавил <b>#{tid}</b> на <b>{when}</b>:\n<i>{txt}</i>{tail}"
+        f"Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{txt}</i>{tail}"
     )
 
 
@@ -562,6 +646,12 @@ async def restore_reminders(app: Application):
 
 
 def main():
+    if not TOKEN:
+        raise SystemExit(
+            "BOT_TOKEN env var not set. Get a token from @BotFather and run:\n"
+            '  PowerShell: $env:BOT_TOKEN = "123456:ABC..."; python bot.py\n'
+            "  cmd.exe:    set BOT_TOKEN=123456:ABC... && python bot.py"
+        )
     db_init()
     app = (
         Application.builder()
@@ -578,6 +668,7 @@ def main():
     app.add_handler(CommandHandler("day", cmd_day))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("del", cmd_del))
+    app.add_handler(CommandHandler("prio", cmd_prio))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
