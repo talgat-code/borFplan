@@ -102,7 +102,7 @@ def db_set_priority(task_id, user_id, priority):
 
 def db_list_tasks(user_id, day=None, days_ahead=None):
     with db_connect() as conn:
-        order = "done, priority DESC, remind_at IS NULL, remind_at, id"
+        order = f"done, {PRIO_SORT_CASE}, remind_at IS NULL, remind_at, id"
         if day is not None:
             return conn.execute(
                 f"SELECT * FROM tasks WHERE user_id = ? AND task_date = ? "
@@ -155,12 +155,21 @@ def db_pending_reminders():
         ).fetchall()
 
 
+def db_list_matrix(user_id):
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE user_id = ? AND done = 0 "
+            "ORDER BY task_date, remind_at IS NULL, remind_at, id",
+            (user_id,),
+        ).fetchall()
+
+
 def db_list_overdue(user_id):
     today = datetime.now(TZ).date().isoformat()
     with db_connect() as conn:
         return conn.execute(
-            "SELECT * FROM tasks WHERE user_id = ? AND done = 0 AND task_date < ? "
-            "ORDER BY task_date, priority DESC, remind_at IS NULL, remind_at, id",
+            f"SELECT * FROM tasks WHERE user_id = ? AND done = 0 AND task_date < ? "
+            f"ORDER BY task_date, {PRIO_SORT_CASE}, remind_at IS NULL, remind_at, id",
             (user_id, today),
         ).fetchall()
 
@@ -196,8 +205,8 @@ def db_search(user_id, term):
     needle = term.lower()
     with db_connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE user_id = ? "
-            "ORDER BY done, task_date, priority DESC, remind_at IS NULL, remind_at, id",
+            f"SELECT * FROM tasks WHERE user_id = ? "
+            f"ORDER BY done, task_date, {PRIO_SORT_CASE}, remind_at IS NULL, remind_at, id",
             (user_id,),
         ).fetchall()
     return [r for r in rows if needle in r["text"].lower()]
@@ -333,8 +342,22 @@ def parse_date_only(s: str):
     return None
 
 
-PRIO_ICONS = {0: "▫️", 1: "🟡", 2: "🔴"}
-PRIO_NAMES = {0: "обычная", 1: "важно", 2: "срочно"}
+PRIO_ICONS = {0: "▫️", 1: "🟡", 2: "🔴", 3: "🟣"}
+PRIO_NAMES = {
+    0: "обычная",
+    1: "важно (запланировать)",
+    2: "срочно+важно (сделать сейчас)",
+    3: "срочно (делегировать)",
+}
+# Sort order across priorities: do-now (2) > schedule (1) > delegate (3) > normal (0).
+# Used in SQL ORDER BY as a CASE expression.
+PRIO_SORT_CASE = (
+    "CASE priority "
+    "WHEN 2 THEN 0 "
+    "WHEN 1 THEN 1 "
+    "WHEN 3 THEN 2 "
+    "ELSE 3 END"
+)
 
 
 def parse_hhmm(s: str):
@@ -566,6 +589,44 @@ def render_tasks(rows, header: str) -> str:
     return "\n".join(out)
 
 
+MATRIX_SECTIONS = [
+    (2, "🔴 Сделать сейчас", "важно и срочно"),
+    (1, "🟡 Запланировать", "важно, не срочно"),
+    (3, "🟣 Делегировать", "срочно, не важно"),
+    (0, "▫️ Не классифицировано", "ни важно, ни срочно — может удалить?"),
+]
+
+
+def render_matrix(rows) -> str:
+    groups = {0: [], 1: [], 2: [], 3: []}
+    for r in rows:
+        groups.setdefault(r["priority"], []).append(r)
+    today = datetime.now(TZ).date()
+    out = ["<b>📊 Матрица Эйзенхауэра</b>"]
+    for p, title, hint in MATRIX_SECTIONS:
+        items = groups.get(p, [])
+        out.append(f"\n<b>{title}</b> · <i>{hint}</i>")
+        if not items:
+            out.append("  — пусто")
+            continue
+        for r in items:
+            d = date.fromisoformat(r["task_date"])
+            overdue_mark = "⚠️ " if d < today else ""
+            time_mark = ""
+            if r["remind_at"]:
+                try:
+                    ra = datetime.fromisoformat(r["remind_at"])
+                    time_mark = f" ⏰{ra.strftime('%H:%M')}"
+                except ValueError:
+                    pass
+            out.append(
+                f"  <b>#{r['id']}</b> <i>{overdue_mark}{fmt_date(d)}{time_mark}</i>\n"
+                f"     {r['text']}"
+            )
+    out.append(f"\n— Всего в работе: {len(rows)} —")
+    return "\n".join(out)
+
+
 def view_for(user_id, view_code: str):
     """Return (rows, header) for a callback view code."""
     if view_code == "t":
@@ -600,20 +661,22 @@ HELP = (
     "• <code>25.05.2026 14:30 !! встреча с клиентом</code>\n"
     "• <code>2026-05-25 ! сдать отчёт</code>\n\n"
     "Если указано время (<code>HH:MM</code>) — пришлю напоминание.\n\n"
-    "<b>Приоритеты:</b> ▫️ обычная · 🟡 важно (<code>!</code>) · 🔴 срочно (<code>!!</code>).\n"
-    "В списке срочные идут первыми. Прио можно поставить и кнопкой 🟡/🔴 под задачей (она циклит).\n\n"
+    "<b>Приоритеты (матрица Эйзенхауэра):</b>\n"
+    "▫️ обычная · 🟡 важно (<code>!</code>) — запланировать · 🔴 срочно (<code>!!</code>) — сделать сейчас · 🟣 делегировать.\n"
+    "Кнопка приоритета под задачей циклит: ▫️ → 🟡 → 🔴 → 🟣.\n\n"
     "<b>Просмотр:</b>\n"
     "/today — дела на сегодня\n"
     "/tomorrow — на завтра\n"
     "/week — на ближайшие 7 дней\n"
     "/all — все будущие дела\n"
     "/overdue — просроченные (не сделаны и дата прошла)\n"
+    "/matrix — матрица Эйзенхауэра (4 квадранта)\n"
     "/day 25.05.2026 — на конкретную дату\n"
     "/find молоко — поиск по тексту\n"
     "/stats — статистика\n\n"
     "<b>Изменение задачи:</b>\n"
     "/done 12 — переключить «сделано» для #12\n"
-    "/prio 12 ! — задать приоритет (или 0/1/2)\n"
+    "/prio 12 ! — задать приоритет (0/1/2/3 или !, !!, делегировать)\n"
     "/edit 12 новый текст — изменить текст (можно с <code>!</code>/<code>!!</code>)\n"
     "/snooze 12 — на завтра (или сегодня, если просрочено)\n"
     "/snooze 12 +3 — через 3 дня\n"
@@ -626,7 +689,7 @@ HELP = (
     "/morning off — выключить · /morning — узнать текущее время\n"
     "Когда сработает напоминание — кнопки: ⏰ +15м · ⏰ +1ч · ⏰ +1д (отложить).\n\n"
     "/help — эта подсказка\n\n"
-    "Под списком кнопки: ✅/↩️ (готово/вернуть) · 🟡/🔴 (циклить приоритет) · ⏭ (отложить на день) · 🗑 (удалить)."
+    "Под списком кнопки: ✅/↩️ (готово/вернуть) · ▫️/🟡/🔴/🟣 (циклить приоритет) · ⏭ (отложить на день) · 🗑 (удалить)."
 )
 
 
@@ -639,7 +702,15 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 
 async def reply_view(update: Update, view_code: str):
-    rows, header = view_for(update.effective_user.id, view_code)
+    user_id = update.effective_user.id
+    if view_code == "m":
+        rows = db_list_matrix(user_id)
+        await update.message.reply_html(
+            render_matrix(rows),
+            reply_markup=tasks_keyboard(rows, "m"),
+        )
+        return
+    rows, header = view_for(user_id, view_code)
     await update.message.reply_html(
         render_tasks(rows, header),
         reply_markup=tasks_keyboard(rows, view_code),
@@ -677,6 +748,10 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_overdue(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await reply_view(update, "o")
+
+
+async def cmd_matrix(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await reply_view(update, "m")
 
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -919,10 +994,11 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_prio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Использование: /prio 12 <0|1|2>\n"
-            "  0 — обычная\n"
-            "  1 — важно 🟡 (можно «!» или «важно»)\n"
-            "  2 — срочно 🔴 (можно «!!» или «срочно»)"
+            "Использование: /prio 12 <0|1|2|3>\n"
+            "  0 ▫️ — обычная\n"
+            "  1 🟡 — важно / запланировать (можно «!»)\n"
+            "  2 🔴 — срочно+важно / сделать сейчас (можно «!!»)\n"
+            "  3 🟣 — срочно / делегировать"
         )
         return
     try:
@@ -934,10 +1010,15 @@ async def cmd_prio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     aliases = {
         "0": 0, "обычная": 0, "обычный": 0, "обычно": 0, "norm": 0, "normal": 0,
         "1": 1, "!": 1, "важно": 1, "важная": 1, "high": 1,
+        "запланировать": 1, "план": 1, "plan": 1, "schedule": 1,
         "2": 2, "!!": 2, "срочно": 2, "срочная": 2, "urgent": 2,
+        "сделать": 2, "сейчас": 2, "do": 2, "now": 2,
+        "3": 3, "делегировать": 3, "deleg": 3, "delegate": 3, "перепоручить": 3,
     }
     if raw not in aliases:
-        await update.message.reply_text("Не понял уровень. Используй 0, 1, 2 или !, !!")
+        await update.message.reply_text(
+            "Не понял уровень. Используй 0, 1, 2, 3 или !, !!, делегировать"
+        )
         return
     if not db_get_task(tid, update.effective_user.id):
         await update.message.reply_text("Такой задачи нет")
@@ -1065,7 +1146,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "prio":
         row = db_get_task(tid, user_id)
         if row:
-            db_set_priority(tid, user_id, (row["priority"] + 1) % 3)
+            db_set_priority(tid, user_id, (row["priority"] + 1) % 4)
     elif action == "snz":
         row = db_get_task(tid, user_id)
         if row:
@@ -1076,9 +1157,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏭ <b>#{tid}</b> отложена на <b>{fmt_date(new_date)}</b>"
             )
 
-    rows, header = view_for(user_id, view)
-    text = render_tasks(rows, header)
-    kb = tasks_keyboard(rows, view)
+    if view == "m":
+        rows = db_list_matrix(user_id)
+        text = render_matrix(rows)
+        kb = tasks_keyboard(rows, "m")
+    else:
+        rows, header = view_for(user_id, view)
+        text = render_tasks(rows, header)
+        kb = tasks_keyboard(rows, view)
     try:
         await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
@@ -1180,6 +1266,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cmd_overdue(update, context)
     if lower in ("стата", "статистика", "stats"):
         return await cmd_stats(update, context)
+    if lower in ("матрица", "матрица эйзенхауэра", "matrix", "eisenhower"):
+        return await cmd_matrix(update, context)
 
     parsed = parse_input(text)
     if not parsed:
@@ -1292,6 +1380,7 @@ def main():
     app.add_handler(CommandHandler("all", cmd_all))
     app.add_handler(CommandHandler("day", cmd_day))
     app.add_handler(CommandHandler("overdue", cmd_overdue))
+    app.add_handler(CommandHandler("matrix", cmd_matrix))
     app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("done", cmd_done))
