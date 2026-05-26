@@ -71,6 +71,7 @@ BOT_COMMANDS = [
     ("done", "✅ Сделано / вернуть"),
     ("del", "🗑 Удалить задачу"),
     ("clear", "🧹 Удалить все выполненные"),
+    ("reset", "🔥 Удалить ВСЁ (полная очистка)"),
     ("help", "❓ Как пользоваться"),
 ]
 
@@ -258,6 +259,22 @@ def db_clear_done(user_id):
             "DELETE FROM tasks WHERE user_id = ? AND done = 1",
             (user_id,),
         )
+        return cur.rowcount
+
+
+def db_get_user_task_ids(user_id):
+    with db_connect() as conn:
+        return [
+            r[0] for r in conn.execute(
+                "SELECT id FROM tasks WHERE user_id = ?", (user_id,)
+            ).fetchall()
+        ]
+
+
+def db_delete_all_user_data(user_id):
+    with db_connect() as conn:
+        cur = conn.execute("DELETE FROM tasks WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_settings WHERE user_id = ?", (user_id,))
         return cur.rowcount
 
 
@@ -766,6 +783,7 @@ HELP = (
     "<code>/snooze 12</code> — на завтра · <code>/snooze 12 +3</code> · <code>/snooze 12 25.05</code>\n"
     "<code>/remind 12 18:00</code> — напоминание · <code>/remind 12 off</code> — снять\n"
     "<code>/del 12</code> — удалить · <code>/clear</code> — удалить все выполненные\n"
+    "<code>/reset</code> — 🔥 удалить ВСЁ (задачи + дайджест + напоминания)\n"
 )
 
 
@@ -1041,6 +1059,30 @@ async def cmd_clear(update: Update, _: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    s = db_stats(user_id)
+    morning = db_get_morning(user_id)
+    has_morning = bool(morning and morning["morning_time"])
+    if s["total"] == 0 and not has_morning:
+        await update.message.reply_text("Нечего удалять — у тебя пока пусто 🙂")
+        return
+    lines = ["🔥 <b>Удалить ВСЕ твои данные?</b>", ""]
+    lines.append(f"• Задач: <b>{s['total']}</b> (выполнено: {s['done']}, в работе: {s['pending']})")
+    if has_morning:
+        lines.append(
+            f"• Утренний дайджест: <b>{morning['morning_time']}</b> — будет выключен"
+        )
+    lines.append("• Все напоминания будут сняты")
+    lines.append("")
+    lines.append("⚠️ Это <b>необратимо</b>.")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔥 Удалить всё", callback_data="reset:yes"),
+        InlineKeyboardButton("Отмена", callback_data="reset:no"),
+    ]])
+    await update.message.reply_html("\n".join(lines), reply_markup=kb)
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Использование: /done 12")
@@ -1147,6 +1189,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "clear:no":
         try:
             await q.edit_message_text("Отменено.")
+        except Exception as e:
+            log.debug("edit_message_text failed: %s", e)
+        return
+    if data == "reset:yes":
+        task_ids = db_get_user_task_ids(user_id)
+        for tid in task_ids:
+            for j in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
+                j.schedule_removal()
+        for j in context.job_queue.get_jobs_by_name(f"morning:{user_id}"):
+            j.schedule_removal()
+        n = db_delete_all_user_data(user_id)
+        try:
+            await q.edit_message_text(
+                f"🔥 Готово. Удалено задач: <b>{n}</b>.\n"
+                f"Утренний дайджест выключен, напоминания сняты. Чистый лист.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            log.debug("edit_message_text failed: %s", e)
+        return
+    if data == "reset:no":
+        try:
+            await q.edit_message_text("Отменено. Ничего не удалил.")
         except Exception as e:
             log.debug("edit_message_text failed: %s", e)
         return
@@ -1482,6 +1547,7 @@ def main():
     app.add_handler(CommandHandler("remind", cmd_remind))
     app.add_handler(CommandHandler("morning", cmd_morning))
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
