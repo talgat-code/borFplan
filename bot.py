@@ -278,6 +278,14 @@ def db_delete_all_user_data(user_id):
         return cur.rowcount
 
 
+def db_user_has_reminder(user_id):
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM tasks WHERE user_id = ? AND remind_at IS NOT NULL LIMIT 1",
+            (user_id,),
+        ).fetchone() is not None
+
+
 def db_count_done(user_id):
     with db_connect() as conn:
         return conn.execute(
@@ -504,67 +512,162 @@ def extract_priority(text: str):
     return prio, cleaned
 
 
-def parse_input(text: str):
-    """Parse 'date [time] task text' → (date, time|None, text) or None."""
-    s = text.strip()
-    today = datetime.now(TZ).date()
+WEEKDAY_PATTERNS = [
+    (0, r"понедельник\w*|пн"),
+    (1, r"вторник\w*|вт"),
+    (2, r"сред[аыу]\w*|ср"),
+    (3, r"четверг\w*|чт"),
+    (4, r"пятниц[ауы]\w*|пт"),
+    (5, r"суббот[ауы]\w*|сб"),
+    (6, r"воскресень[еяё]\w*|вс"),
+]
 
-    d = None
-    rest = s
+VAGUE_TIMES = {
+    "утром": dtime(9, 0), "утро": dtime(9, 0),
+    "днем": dtime(13, 0), "днём": dtime(13, 0), "день": dtime(13, 0),
+    "вечером": dtime(19, 0), "вечер": dtime(19, 0),
+    "ночью": dtime(22, 0), "ночь": dtime(22, 0),
+}
 
+
+def _try_parse_relative(s: str):
+    """'через 30 минут X' / 'через час X' / 'через 3 дня X' → (date, time|None, rest)."""
+    now = datetime.now(TZ)
+    today = now.date()
     m = re.match(
-        r"^(сегодня|завтра|послезавтра|today|tomorrow)\b\s*(.*)$",
-        rest, re.IGNORECASE,
+        r"^через\s+(\d+)\s+(минут\w*|час\w*|дн\w*|нед\w*)\s+(.+)$",
+        s, re.IGNORECASE,
     )
     if m:
-        d = today + timedelta(days=DATE_KEYWORDS[m.group(1).lower()])
-        rest = m.group(2)
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        rest = m.group(3)
     else:
-        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})\s+(.*)$", rest)
-        if m:
-            try:
-                d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                rest = m.group(4)
-            except ValueError:
-                return None
-        else:
-            m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+(.*)$", rest)
-            if m:
-                day_v, month_v = int(m.group(1)), int(m.group(2))
-                year_raw = m.group(3)
-                if year_raw:
-                    year_v = int(year_raw)
-                    if year_v < 100:
-                        year_v += 2000
-                else:
-                    year_v = today.year
-                    try:
-                        if date(year_v, month_v, day_v) < today:
-                            year_v += 1
-                    except ValueError:
-                        pass
-                try:
-                    d = date(year_v, month_v, day_v)
-                    rest = m.group(4)
-                except ValueError:
-                    return None
+        m = re.match(
+            r"^через\s+(минуту|час|день|неделю)\s+(.+)$",
+            s, re.IGNORECASE,
+        )
+        if not m:
+            return None
+        n = 1
+        unit = m.group(1).lower()
+        rest = m.group(2)
+    if unit.startswith("минут"):
+        target = now + timedelta(minutes=n)
+        return target.date(), dtime(target.hour, target.minute), rest
+    if unit.startswith("час"):
+        target = now + timedelta(hours=n)
+        return target.date(), dtime(target.hour, target.minute), rest
+    if unit.startswith("дн") or unit == "день":
+        return today + timedelta(days=n), None, rest
+    if unit.startswith("нед"):
+        return today + timedelta(weeks=n), None, rest
+    return None
 
-    if d is None:
-        return None
 
-    t = None
-    m = re.match(r"^(?:в\s+)?(\d{1,2}):(\d{2})\s+(.*)$", rest, re.IGNORECASE)
+def _try_parse_date_prefix(s: str):
+    """Match a date prefix → (date, rest) or (None, s)."""
+    today = datetime.now(TZ).date()
+    m = re.match(
+        r"^(сегодня|завтра|послезавтра|today|tomorrow)\b\s*(.*)$",
+        s, re.IGNORECASE,
+    )
+    if m:
+        return today + timedelta(days=DATE_KEYWORDS[m.group(1).lower()]), m.group(2)
+    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})\s+(.*)$", s)
     if m:
         try:
-            t = dtime(int(m.group(1)), int(m.group(2)))
-            rest = m.group(3)
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))), m.group(4)
         except ValueError:
-            pass
+            return None, s
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+(.*)$", s)
+    if m:
+        day_v, month_v = int(m.group(1)), int(m.group(2))
+        year_raw = m.group(3)
+        if year_raw:
+            year_v = int(year_raw)
+            if year_v < 100:
+                year_v += 2000
+        else:
+            year_v = today.year
+            try:
+                if date(year_v, month_v, day_v) < today:
+                    year_v += 1
+            except ValueError:
+                pass
+        try:
+            return date(year_v, month_v, day_v), m.group(4)
+        except ValueError:
+            return None, s
+    # Weekday name (optionally with "в"/"во" prefix): "пн X", "в пятницу X"
+    for wd, pat in WEEKDAY_PATTERNS:
+        m = re.match(rf"^(?:в[оо]?\s+)?({pat})\b\s+(.+)$", s, re.IGNORECASE)
+        if m:
+            delta = (wd - today.weekday()) % 7
+            return today + timedelta(days=delta), m.group(2)
+    return None, s
 
-    rest = rest.strip()
-    if not rest:
-        return None
-    return d, t, rest
+
+def _try_parse_time_prefix(s: str):
+    """Match a time prefix → (time, rest) or (None, s).
+    Supports HH:MM and vague labels (утром / днём / вечером / ночью)."""
+    m = re.match(r"^(?:в\s+)?(\d{1,2}):(\d{2})\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        try:
+            return dtime(int(m.group(1)), int(m.group(2))), m.group(3)
+        except ValueError:
+            return None, s
+    m = re.match(r"^(утром|утро|днё?м|день|вечером|вечер|ночью|ночь)\s+(.+)$",
+                 s, re.IGNORECASE)
+    if m:
+        word = m.group(1).lower()
+        if word in VAGUE_TIMES:
+            return VAGUE_TIMES[word], m.group(2)
+    return None, s
+
+
+def parse_input(text: str):
+    """Parse 'date [time] task text' → (date, time|None, text) or None.
+
+    Supports:
+      • сегодня/завтра/послезавтра, today/tomorrow
+      • ДД.ММ[.ГГ], ГГГГ-ММ-ДД
+      • день недели (пн, понедельник, в пятницу, …)
+      • относительные сроки: через 30 минут / через 2 часа / через 3 дня / через неделю
+      • время как HH:MM (с опциональным 'в') и нечёткое: утром/днём/вечером/ночью
+      • время без даты: '15:00 X' → сегодня (или завтра, если уже прошло)
+    """
+    s = text.strip()
+    today = datetime.now(TZ).date()
+    now = datetime.now(TZ)
+
+    rel = _try_parse_relative(s)
+    if rel:
+        d, t, rest = rel
+        rest = rest.strip()
+        if not rest:
+            return None
+        return d, t, rest
+
+    d, rest = _try_parse_date_prefix(s)
+    if d is not None:
+        t, rest = _try_parse_time_prefix(rest)
+        rest = rest.strip()
+        if not rest:
+            return None
+        return d, t, rest
+
+    # No explicit date — accept standalone time → today (or tomorrow if past).
+    t, rest = _try_parse_time_prefix(s)
+    if t is not None:
+        rest = rest.strip()
+        if not rest:
+            return None
+        candidate = datetime.combine(today, t, tzinfo=TZ)
+        target_date = today if candidate > now else today + timedelta(days=1)
+        return target_date, t, rest
+
+    return None
 
 
 # ---------- Formatting ----------
@@ -717,7 +820,9 @@ WELCOME = (
     "<b>Просто напиши, что и когда:</b>\n"
     "• <code>сегодня позвонить маме</code>\n"
     "• <code>завтра 18:00 встреча</code> — пришлю напоминание в 18:00\n"
-    "• <code>25.05 !! сдать отчёт</code> — срочно и важно\n\n"
+    "• <code>через 30 минут выпить воды</code> — напомню через 30 мин\n"
+    "• <code>пт !! сдать отчёт</code> — в пятницу, срочно+важно\n"
+    "• <code>вечером ужин</code> — сегодня в 19:00\n\n"
     "Внизу — быстрые кнопки (📅 Сегодня · 📆 Завтра · 🗓 Неделя · 📊 Матрица…).\n"
     "Рядом со скрепкой есть кнопка «☰» — там список всех команд.\n\n"
     "Подробная справка: /help"
@@ -728,14 +833,23 @@ HELP = (
     "📖 <b>Как пользоваться</b>\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "✍️ <b>1. Как добавить задачу</b>\n"
-    "Просто напиши <i>дату [время] текст</i>:\n"
+    "Просто напиши, что и когда. Бот понимает много форматов:\n\n"
+    "<b>Дата:</b>\n"
     "• <code>сегодня позвонить маме</code>\n"
-    "• <code>завтра 09:00 пробежка</code>\n"
-    "• <code>25.05 купить молоко</code>\n"
-    "• <code>25.05.2026 14:30 встреча</code>\n"
-    "• <code>2026-05-25 отчёт</code>\n\n"
-    "Дата: <code>сегодня/завтра/послезавтра</code>, <code>ДД.ММ</code>, "
-    "<code>ДД.ММ.ГГГГ</code> или <code>ГГГГ-ММ-ДД</code>.\n\n"
+    "• <code>завтра пробежка</code> · <code>послезавтра отчёт</code>\n"
+    "• <code>пт сдать проект</code> · <code>в понедельник встреча</code>\n"
+    "• <code>25.05 купить молоко</code> · <code>25.05.2026 ...</code>\n"
+    "• <code>2026-05-25 ...</code>\n\n"
+    "<b>Относительное время:</b>\n"
+    "• <code>через 30 минут позвонить</code>\n"
+    "• <code>через 2 часа встреча</code>\n"
+    "• <code>через 3 дня дедлайн</code> · <code>через неделю ...</code>\n\n"
+    "<b>Время:</b>\n"
+    "• <code>завтра 09:00 пробежка</code> — точное время\n"
+    "• <code>15:00 встреча</code> — без даты, на сегодня (или завтра, если прошло)\n"
+    "• <code>вечером ужин</code> — <i>утром</i>=09:00 · <i>днём</i>=13:00 · "
+    "<i>вечером</i>=19:00 · <i>ночью</i>=22:00\n\n"
+    "Указал точное время — пришлю напоминание автоматически.\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "⏰ <b>2. Как сделать напоминание</b>\n"
     "<b>Способ 1.</b> Указать время прямо в задаче:\n"
@@ -1415,9 +1529,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_input(text)
     if not parsed:
         await update.message.reply_text(
-            "Не разобрал. Пример:\n"
+            "Не разобрал. Примеры:\n"
             "  • сегодня позвонить маме\n"
-            "  • 25.05 14:30 встреча\n"
+            "  • завтра 18:00 встреча\n"
+            "  • через 30 минут выпить воды\n"
+            "  • пт !! сдать отчёт\n"
+            "  • вечером ужин\n"
             "Подсказка: /help"
         )
         return
@@ -1458,7 +1575,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = "\n⏰ Напомню в указанное время."
     elif t and not schedule:
         tail = "\n⚠️ Время уже прошло — напоминание не ставлю."
-    else:
+    elif not db_user_has_reminder(update.effective_user.id):
         tail = (
             f"\n💡 Хочешь напоминание? <code>/remind {tid} 18:00</code> "
             f"или добавь время в текст задачи."
