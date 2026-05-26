@@ -6,7 +6,13 @@ from datetime import date, datetime, timedelta, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -33,6 +39,40 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("planbot")
+
+
+# ---------- UI constants ----------
+
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        ["📅 Сегодня", "📆 Завтра"],
+        ["🗓 Неделя", "📊 Матрица"],
+        ["⚠️ Просрочено", "📈 Стата"],
+        ["❓ Помощь"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+BOT_COMMANDS = [
+    ("today", "📅 Дела на сегодня"),
+    ("tomorrow", "📆 Дела на завтра"),
+    ("week", "🗓 На ближайшую неделю"),
+    ("matrix", "📊 Матрица Эйзенхауэра"),
+    ("overdue", "⚠️ Просроченные дела"),
+    ("all", "📋 Все будущие дела"),
+    ("stats", "📈 Статистика"),
+    ("find", "🔍 Поиск по тексту"),
+    ("morning", "🌅 Утренний дайджест"),
+    ("remind", "⏰ Поставить напоминание"),
+    ("snooze", "⏭ Отложить задачу"),
+    ("prio", "🎯 Сменить приоритет"),
+    ("edit", "✏️ Изменить текст задачи"),
+    ("done", "✅ Сделано / вернуть"),
+    ("del", "🗑 Удалить задачу"),
+    ("clear", "🧹 Удалить все выполненные"),
+    ("help", "❓ Как пользоваться"),
+]
 
 
 # ---------- DB ----------
@@ -624,6 +664,9 @@ def render_matrix(rows) -> str:
                 f"     {r['text']}"
             )
     out.append(f"\n— Всего в работе: {len(rows)} —")
+    out.append(
+        "💡 Кнопка цвета под задачей циклит квадрант: ▫️ → 🟡 → 🔴 → 🟣."
+    )
     return "\n".join(out)
 
 
@@ -652,53 +695,86 @@ def view_for(user_id, view_code: str):
 
 # ---------- Handlers ----------
 
-HELP = (
-    "Привет! Я помогу планировать дела по датам.\n\n"
-    "<b>Как добавить задачу — просто напиши:</b>\n"
+WELCOME = (
+    "👋 <b>Привет! Я планировщик дел.</b>\n\n"
+    "<b>Просто напиши, что и когда:</b>\n"
     "• <code>сегодня позвонить маме</code>\n"
-    "• <code>завтра в 09:00 утренняя пробежка</code>\n"
+    "• <code>завтра 18:00 встреча</code> — пришлю напоминание в 18:00\n"
+    "• <code>25.05 !! сдать отчёт</code> — срочно и важно\n\n"
+    "Внизу — быстрые кнопки (📅 Сегодня · 📆 Завтра · 🗓 Неделя · 📊 Матрица…).\n"
+    "Рядом со скрепкой есть кнопка «☰» — там список всех команд.\n\n"
+    "Подробная справка: /help"
+)
+
+
+HELP = (
+    "📖 <b>Как пользоваться</b>\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "✍️ <b>1. Как добавить задачу</b>\n"
+    "Просто напиши <i>дату [время] текст</i>:\n"
+    "• <code>сегодня позвонить маме</code>\n"
+    "• <code>завтра 09:00 пробежка</code>\n"
     "• <code>25.05 купить молоко</code>\n"
-    "• <code>25.05.2026 14:30 !! встреча с клиентом</code>\n"
-    "• <code>2026-05-25 ! сдать отчёт</code>\n\n"
-    "Если указано время (<code>HH:MM</code>) — пришлю напоминание.\n\n"
-    "<b>Приоритеты (матрица Эйзенхауэра):</b>\n"
-    "▫️ обычная · 🟡 важно (<code>!</code>) — запланировать · 🔴 срочно (<code>!!</code>) — сделать сейчас · 🟣 делегировать.\n"
-    "Кнопка приоритета под задачей циклит: ▫️ → 🟡 → 🔴 → 🟣.\n\n"
-    "<b>Просмотр:</b>\n"
-    "/today — дела на сегодня\n"
-    "/tomorrow — на завтра\n"
-    "/week — на ближайшие 7 дней\n"
-    "/all — все будущие дела\n"
-    "/overdue — просроченные (не сделаны и дата прошла)\n"
-    "/matrix — матрица Эйзенхауэра (4 квадранта)\n"
-    "/day 25.05.2026 — на конкретную дату\n"
-    "/find молоко — поиск по тексту\n"
+    "• <code>25.05.2026 14:30 встреча</code>\n"
+    "• <code>2026-05-25 отчёт</code>\n\n"
+    "Дата: <code>сегодня/завтра/послезавтра</code>, <code>ДД.ММ</code>, "
+    "<code>ДД.ММ.ГГГГ</code> или <code>ГГГГ-ММ-ДД</code>.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "⏰ <b>2. Как сделать напоминание</b>\n"
+    "<b>Способ 1.</b> Указать время прямо в задаче:\n"
+    "• <code>завтра 18:00 встреча</code> → напомню в 18:00.\n\n"
+    "<b>Способ 2.</b> Поставить позже на готовую задачу:\n"
+    "• <code>/remind 12 18:00</code> — добавить напоминание к #12\n"
+    "• <code>/remind 12 off</code> — снять напоминание\n\n"
+    "<b>Когда напоминание сработает</b>, под ним будут кнопки:\n"
+    "• ⏰ +15м / ⏰ +1ч / ⏰ +1д — отложить напоминание\n"
+    "• ✅ Готово · 🗑 Удалить\n\n"
+    "<b>Утренний дайджест</b> (план на день каждое утро):\n"
+    "• <code>/morning 09:00</code> — включить · <code>/morning off</code> — выключить\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "📊 <b>3. Матрица Эйзенхауэра</b>\n"
+    "Каждая задача попадает в один из 4 квадрантов:\n"
+    "🔴 <b>Сделать сейчас</b> — важно <i>и</i> срочно\n"
+    "🟡 <b>Запланировать</b> — важно, не срочно\n"
+    "🟣 <b>Делегировать</b> — срочно, не важно\n"
+    "▫️ <b>Обычная</b> / «удалить» — ни важно, ни срочно\n\n"
+    "<b>Как поставить квадрант:</b>\n"
+    "• В тексте: <code>!</code> = 🟡 важно, <code>!!</code> = 🔴 сделать сейчас.\n"
+    "  Пример: <code>завтра !! сдать отчёт</code>\n"
+    "• Кнопкой под задачей — циклит ▫️ → 🟡 → 🔴 → 🟣.\n"
+    "• Командой: <code>/prio 12 !!</code> или <code>/prio 12 делегировать</code>.\n\n"
+    "Открыть матрицу: /matrix\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "📋 <b>4. Списки задач</b>\n"
+    "/today — на сегодня · /tomorrow — на завтра\n"
+    "/week — на 7 дней · /all — все будущие\n"
+    "/overdue — просроченные · /matrix — матрица\n"
+    "/day 25.05.2026 — конкретная дата\n"
+    "/find слово — поиск по тексту\n"
     "/stats — статистика\n\n"
-    "<b>Изменение задачи:</b>\n"
-    "/done 12 — переключить «сделано» для #12\n"
-    "/prio 12 ! — задать приоритет (0/1/2/3 или !, !!, делегировать)\n"
-    "/edit 12 новый текст — изменить текст (можно с <code>!</code>/<code>!!</code>)\n"
-    "/snooze 12 — на завтра (или сегодня, если просрочено)\n"
-    "/snooze 12 +3 — через 3 дня\n"
-    "/snooze 12 25.05 — на конкретную дату\n"
-    "/remind 12 18:00 — поставить/изменить напоминание · /remind 12 off — снять\n"
-    "/del 12 — удалить задачу #12\n"
-    "/clear — удалить все выполненные (с подтверждением)\n\n"
-    "<b>Уведомления:</b>\n"
-    "/morning 09:00 — присылать план на день каждое утро\n"
-    "/morning off — выключить · /morning — узнать текущее время\n"
-    "Когда сработает напоминание — кнопки: ⏰ +15м · ⏰ +1ч · ⏰ +1д (отложить).\n\n"
-    "/help — эта подсказка\n\n"
-    "Под списком кнопки: ✅/↩️ (готово/вернуть) · ▫️/🟡/🔴/🟣 (циклить приоритет) · ⏭ (отложить на день) · 🗑 (удалить)."
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "✏️ <b>5. Кнопки под каждой задачей</b>\n"
+    "✅/↩️ — сделано / вернуть в работу\n"
+    "🟡 🔴 🟣 ▫️ — циклить квадрант приоритета\n"
+    "⏭ — отложить на день\n"
+    "🗑 — удалить\n\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "⚙️ <b>6. Команды для конкретной задачи</b>\n"
+    "<code>/done 12</code> — переключить «сделано»\n"
+    "<code>/edit 12 новый текст</code> — изменить текст\n"
+    "<code>/prio 12 !</code> — приоритет (0/1/2/3 или !, !!, делегировать)\n"
+    "<code>/snooze 12</code> — на завтра · <code>/snooze 12 +3</code> · <code>/snooze 12 25.05</code>\n"
+    "<code>/remind 12 18:00</code> — напоминание · <code>/remind 12 off</code> — снять\n"
+    "<code>/del 12</code> — удалить · <code>/clear</code> — удалить все выполненные\n"
 )
 
 
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(HELP)
+    await update.message.reply_html(WELCOME, reply_markup=MAIN_KB)
 
 
 async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(HELP)
+    await update.message.reply_html(HELP, reply_markup=MAIN_KB)
 
 
 async def reply_view(update: Update, view_code: str):
@@ -1254,20 +1330,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     lower = text.lower()
 
-    if lower in ("сегодня", "today"):
+    if lower in ("сегодня", "today", "📅 сегодня"):
         return await cmd_today(update, context)
-    if lower in ("завтра", "tomorrow"):
+    if lower in ("завтра", "tomorrow", "📆 завтра"):
         return await cmd_tomorrow(update, context)
-    if lower in ("неделя", "week"):
+    if lower in ("неделя", "week", "🗓 неделя"):
         return await cmd_week(update, context)
     if lower in ("все", "всё", "all"):
         return await cmd_all(update, context)
-    if lower in ("просрочено", "просроченные", "overdue"):
+    if lower in ("просрочено", "просроченные", "overdue", "⚠️ просрочено"):
         return await cmd_overdue(update, context)
-    if lower in ("стата", "статистика", "stats"):
+    if lower in ("стата", "статистика", "stats", "📈 стата"):
         return await cmd_stats(update, context)
-    if lower in ("матрица", "матрица эйзенхауэра", "matrix", "eisenhower"):
+    if lower in ("матрица", "матрица эйзенхауэра", "matrix", "eisenhower", "📊 матрица"):
         return await cmd_matrix(update, context)
+    if lower in ("помощь", "help", "❓ помощь"):
+        return await cmd_help(update, context)
 
     parsed = parse_input(text)
     if not parsed:
@@ -1315,6 +1393,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = "\n⏰ Напомню в указанное время."
     elif t and not schedule:
         tail = "\n⚠️ Время уже прошло — напоминание не ставлю."
+    else:
+        tail = (
+            f"\n💡 Хочешь напоминание? <code>/remind {tid} 18:00</code> "
+            f"или добавь время в текст задачи."
+        )
     prio_label = ""
     if prio:
         prio_label = f" {PRIO_ICONS[prio]} <i>({PRIO_NAMES[prio]})</i>"
@@ -1323,6 +1406,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{txt}</i>{tail}"
     )
     await send_reaction(context.bot, update.effective_chat.id, PHOTO_ADD, caption)
+
+
+async def post_init(app: Application):
+    try:
+        await app.bot.set_my_commands([BotCommand(*c) for c in BOT_COMMANDS])
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+    await restore_reminders(app)
 
 
 async def restore_reminders(app: Application):
@@ -1369,7 +1460,7 @@ def main():
         Application.builder()
         .token(TOKEN)
         .defaults(Defaults(tzinfo=TZ))
-        .post_init(restore_reminders)
+        .post_init(post_init)
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
