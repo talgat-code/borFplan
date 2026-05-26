@@ -149,6 +149,104 @@ def db_pending_reminders():
         ).fetchall()
 
 
+def db_list_overdue(user_id):
+    today = datetime.now(TZ).date().isoformat()
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE user_id = ? AND done = 0 AND task_date < ? "
+            "ORDER BY task_date, priority DESC, remind_at IS NULL, remind_at, id",
+            (user_id, today),
+        ).fetchall()
+
+
+def db_update_text(task_id, user_id, text, priority=None):
+    with db_connect() as conn:
+        if priority is None:
+            conn.execute(
+                "UPDATE tasks SET text = ? WHERE id = ? AND user_id = ?",
+                (text, task_id, user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET text = ?, priority = ? WHERE id = ? AND user_id = ?",
+                (text, priority, task_id, user_id),
+            )
+
+
+def db_update_schedule(task_id, user_id, new_date, new_remind_at):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET task_date = ?, remind_at = ? WHERE id = ? AND user_id = ?",
+            (
+                new_date.isoformat(),
+                new_remind_at.isoformat() if new_remind_at else None,
+                task_id,
+                user_id,
+            ),
+        )
+
+
+def db_search(user_id, term):
+    needle = term.lower()
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE user_id = ? "
+            "ORDER BY done, task_date, priority DESC, remind_at IS NULL, remind_at, id",
+            (user_id,),
+        ).fetchall()
+    return [r for r in rows if needle in r["text"].lower()]
+
+
+def db_clear_done(user_id):
+    with db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE user_id = ? AND done = 1",
+            (user_id,),
+        )
+        return cur.rowcount
+
+
+def db_count_done(user_id):
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE user_id = ? AND done = 1",
+            (user_id,),
+        ).fetchone()[0]
+
+
+def db_stats(user_id):
+    today = datetime.now(TZ).date()
+    tom = today + timedelta(days=1)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT done, task_date, priority FROM tasks WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+    total = len(rows)
+    done = sum(1 for r in rows if r["done"])
+    pending = total - done
+    overdue = sum(
+        1 for r in rows
+        if not r["done"] and date.fromisoformat(r["task_date"]) < today
+    )
+    today_n = sum(
+        1 for r in rows
+        if not r["done"] and date.fromisoformat(r["task_date"]) == today
+    )
+    tomorrow_n = sum(
+        1 for r in rows
+        if not r["done"] and date.fromisoformat(r["task_date"]) == tom
+    )
+    urgent = sum(1 for r in rows if not r["done"] and r["priority"] == 2)
+    important = sum(1 for r in rows if not r["done"] and r["priority"] == 1)
+    normal = sum(1 for r in rows if not r["done"] and r["priority"] == 0)
+    return {
+        "total": total, "done": done, "pending": pending,
+        "overdue": overdue, "today": today_n, "tomorrow": tomorrow_n,
+        "urgent": urgent, "important": important, "normal": normal,
+    }
+
+
 # ---------- Parsing ----------
 
 DATE_KEYWORDS = {
@@ -196,6 +294,50 @@ def parse_date_only(s: str):
 
 PRIO_ICONS = {0: "▫️", 1: "🟡", 2: "🔴"}
 PRIO_NAMES = {0: "обычная", 1: "важно", 2: "срочно"}
+
+
+def compute_snooze_date(row, arg=None):
+    """For /snooze: returns new date or None if arg unparseable.
+    No arg → +1 day from task date, or today if overdue."""
+    today = datetime.now(TZ).date()
+    cur = date.fromisoformat(row["task_date"])
+    if not arg:
+        return today if cur < today else cur + timedelta(days=1)
+    arg = arg.strip().lower()
+    m = re.match(r"^\+(\d+)$", arg)
+    if m:
+        base = today if cur < today else cur
+        return base + timedelta(days=int(m.group(1)))
+    return parse_date_only(arg)
+
+
+def reschedule_task_reminder(context, row, new_date):
+    """Move remind_at to new_date keeping the original HH:MM. Returns new remind_at or None."""
+    tid = row["id"]
+    for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
+        job.schedule_removal()
+    if not row["remind_at"]:
+        return None
+    try:
+        old = datetime.fromisoformat(row["remind_at"])
+    except ValueError:
+        return None
+    if old.tzinfo is None:
+        old = old.replace(tzinfo=TZ)
+    new_remind = datetime.combine(new_date, old.timetz())
+    if new_remind.tzinfo is None:
+        new_remind = new_remind.replace(tzinfo=TZ)
+    now = datetime.now(TZ)
+    if new_remind > now:
+        context.job_queue.run_once(
+            send_reminder,
+            when=(new_remind - now).total_seconds(),
+            chat_id=row["chat_id"],
+            user_id=row["user_id"],
+            name=f"remind:{tid}",
+            data={"task_id": tid},
+        )
+    return new_remind
 
 
 async def send_reaction(bot, chat_id: int, photo_path: Path, caption: str):
@@ -330,7 +472,7 @@ def tasks_keyboard(rows, view: str):
     for r in rows:
         flip = "↩️" if r["done"] else "✅"
         prio_icon = PRIO_ICONS.get(r["priority"], "▫️")
-        kb.append([
+        row_btns = [
             InlineKeyboardButton(
                 f"{flip} #{r['id']}",
                 callback_data=f"done:{r['id']}:{view}",
@@ -339,11 +481,21 @@ def tasks_keyboard(rows, view: str):
                 f"{prio_icon} #{r['id']}",
                 callback_data=f"prio:{r['id']}:{view}",
             ),
+        ]
+        if not r["done"]:
+            row_btns.append(
+                InlineKeyboardButton(
+                    f"⏭ #{r['id']}",
+                    callback_data=f"snz:{r['id']}:{view}",
+                )
+            )
+        row_btns.append(
             InlineKeyboardButton(
                 f"🗑 #{r['id']}",
                 callback_data=f"del:{r['id']}:{view}",
-            ),
-        ])
+            )
+        )
+        kb.append(row_btns)
     return InlineKeyboardMarkup(kb) if kb else None
 
 
@@ -375,6 +527,8 @@ def view_for(user_id, view_code: str):
         return db_list_tasks(user_id, days_ahead=6), "Дела на ближайшие 7 дней"
     if view_code == "a":
         return db_list_tasks(user_id), "Все будущие дела"
+    if view_code == "o":
+        return db_list_overdue(user_id), "Просроченные дела"
     if view_code.startswith("d"):
         try:
             d = date.fromisoformat(view_code[1:])
@@ -397,17 +551,26 @@ HELP = (
     "Если указано время (<code>HH:MM</code>) — пришлю напоминание.\n\n"
     "<b>Приоритеты:</b> ▫️ обычная · 🟡 важно (<code>!</code>) · 🔴 срочно (<code>!!</code>).\n"
     "В списке срочные идут первыми. Прио можно поставить и кнопкой 🟡/🔴 под задачей (она циклит).\n\n"
-    "<b>Команды:</b>\n"
+    "<b>Просмотр:</b>\n"
     "/today — дела на сегодня\n"
     "/tomorrow — на завтра\n"
     "/week — на ближайшие 7 дней\n"
     "/all — все будущие дела\n"
+    "/overdue — просроченные (не сделаны и дата прошла)\n"
     "/day 25.05.2026 — на конкретную дату\n"
+    "/find молоко — поиск по тексту\n"
+    "/stats — статистика\n\n"
+    "<b>Изменение задачи:</b>\n"
     "/done 12 — переключить «сделано» для #12\n"
     "/prio 12 ! — задать приоритет (или 0/1/2)\n"
+    "/edit 12 новый текст — изменить текст (можно с <code>!</code>/<code>!!</code>)\n"
+    "/snooze 12 — на завтра (или сегодня, если просрочено)\n"
+    "/snooze 12 +3 — через 3 дня\n"
+    "/snooze 12 25.05 — на конкретную дату\n"
     "/del 12 — удалить задачу #12\n"
+    "/clear — удалить все выполненные (с подтверждением)\n"
     "/help — эта подсказка\n\n"
-    "Под списком кнопки: ✅/↩️ (готово/вернуть) · 🟡/🔴 (циклить приоритет) · 🗑 (удалить)."
+    "Под списком кнопки: ✅/↩️ (готово/вернуть) · 🟡/🔴 (циклить приоритет) · ⏭ (отложить на день) · 🗑 (удалить)."
 )
 
 
@@ -454,6 +617,132 @@ async def cmd_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не понял дату. Пример: /day 25.05.2026")
         return
     await reply_view(update, f"d{d.isoformat()}")
+
+
+async def cmd_overdue(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await reply_view(update, "o")
+
+
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /find слово")
+        return
+    term = " ".join(context.args).strip()
+    if not term:
+        await update.message.reply_text("Использование: /find слово")
+        return
+    rows = db_search(update.effective_user.id, term)
+    header = f"Найдено по «{term}»: {len(rows)}"
+    await update.message.reply_html(
+        render_tasks(rows, header),
+        reply_markup=tasks_keyboard(rows, "a"),
+    )
+
+
+async def cmd_stats(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    s = db_stats(update.effective_user.id)
+    if s["total"] == 0:
+        await update.message.reply_text("Пока ничего нет. Добавь первую задачу 🙂")
+        return
+    pct = round(100 * s["done"] / s["total"]) if s["total"] else 0
+    text = (
+        f"<b>📊 Статистика</b>\n\n"
+        f"Всего задач: <b>{s['total']}</b>\n"
+        f"✅ Сделано: <b>{s['done']}</b> ({pct}%)\n"
+        f"📝 В работе: <b>{s['pending']}</b>\n\n"
+        f"<b>Среди невыполненных:</b>\n"
+        f"⚠️ Просрочено: <b>{s['overdue']}</b>\n"
+        f"📅 На сегодня: <b>{s['today']}</b>\n"
+        f"📅 На завтра: <b>{s['tomorrow']}</b>\n\n"
+        f"<b>По приоритету (в работе):</b>\n"
+        f"🔴 Срочно: <b>{s['urgent']}</b>\n"
+        f"🟡 Важно: <b>{s['important']}</b>\n"
+        f"▫️ Обычные: <b>{s['normal']}</b>"
+    )
+    await update.message.reply_html(text)
+
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /edit 12 новый текст задачи"
+        )
+        return
+    try:
+        tid = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом")
+        return
+    new_text = " ".join(context.args[1:]).strip()
+    if not new_text:
+        await update.message.reply_text("Пустой текст. Добавь описание.")
+        return
+    row = db_get_task(tid, update.effective_user.id)
+    if not row:
+        await update.message.reply_text("Такой задачи нет")
+        return
+    prio, cleaned = extract_priority(new_text)
+    if not cleaned:
+        await update.message.reply_text("Пустой текст после удаления !-меток.")
+        return
+    if prio:
+        db_update_text(tid, update.effective_user.id, cleaned, priority=prio)
+    else:
+        db_update_text(tid, update.effective_user.id, cleaned)
+    await update.message.reply_html(
+        f"Обновил <b>#{tid}</b>:\n<i>{cleaned}</i>"
+    )
+
+
+async def cmd_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /snooze 12 [дата|+N]\n"
+            "Без аргумента — на завтра (или на сегодня, если просрочено)."
+        )
+        return
+    try:
+        tid = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом")
+        return
+    row = db_get_task(tid, update.effective_user.id)
+    if not row:
+        await update.message.reply_text("Такой задачи нет")
+        return
+    arg = " ".join(context.args[1:]).strip() if len(context.args) > 1 else None
+    new_date = compute_snooze_date(row, arg)
+    if not new_date:
+        await update.message.reply_text(
+            "Не понял дату. Примеры: /snooze 12 · /snooze 12 +3 · /snooze 12 25.05"
+        )
+        return
+    new_remind = reschedule_task_reminder(context, row, new_date)
+    db_update_schedule(tid, update.effective_user.id, new_date, new_remind)
+    tail = ""
+    if row["remind_at"] and new_remind and new_remind > datetime.now(TZ):
+        tail = f"\n⏰ Напоминание на {new_remind.strftime('%H:%M')}."
+    elif row["remind_at"] and not (new_remind and new_remind > datetime.now(TZ)):
+        tail = "\n⚠️ Время напоминания уже прошло — не ставлю."
+    await update.message.reply_html(
+        f"Отложил <b>#{tid}</b> на <b>{fmt_date(new_date)}</b>:\n"
+        f"<i>{row['text']}</i>{tail}"
+    )
+
+
+async def cmd_clear(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    n = db_count_done(update.effective_user.id)
+    if n == 0:
+        await update.message.reply_text("Выполненных задач нет.")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🗑 Удалить ({n})", callback_data="clear:yes"),
+        InlineKeyboardButton("Отмена", callback_data="clear:no"),
+    ]])
+    await update.message.reply_html(
+        f"Удалить <b>{n}</b> выполненных задач?",
+        reply_markup=kb,
+    )
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -540,7 +829,27 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    parts = (q.data or "").split(":", 2)
+    data = q.data or ""
+    user_id = q.from_user.id
+    chat_id = q.message.chat_id if q.message else None
+
+    # 2-part callbacks (confirmation flows)
+    if data == "clear:yes":
+        n = db_clear_done(user_id)
+        try:
+            await q.edit_message_text(f"🗑 Удалил выполненных задач: <b>{n}</b>.",
+                                      parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.debug("edit_message_text failed: %s", e)
+        return
+    if data == "clear:no":
+        try:
+            await q.edit_message_text("Отменено.")
+        except Exception as e:
+            log.debug("edit_message_text failed: %s", e)
+        return
+
+    parts = data.split(":", 2)
     if len(parts) < 3:
         return
     action, sid, view = parts
@@ -548,10 +857,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = int(sid)
     except ValueError:
         return
-    user_id = q.from_user.id
 
     reaction = None  # (photo_path, caption) to send after refresh
-    chat_id = q.message.chat_id if q.message else None
+    notice = None  # plain text to send as separate message
 
     if action == "done":
         row = db_get_task(tid, user_id)
@@ -577,6 +885,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = db_get_task(tid, user_id)
         if row:
             db_set_priority(tid, user_id, (row["priority"] + 1) % 3)
+    elif action == "snz":
+        row = db_get_task(tid, user_id)
+        if row:
+            new_date = compute_snooze_date(row)
+            new_remind = reschedule_task_reminder(context, row, new_date)
+            db_update_schedule(tid, user_id, new_date, new_remind)
+            notice = (
+                f"⏭ <b>#{tid}</b> отложена на <b>{fmt_date(new_date)}</b>"
+            )
 
     rows, header = view_for(user_id, view)
     text = render_tasks(rows, header)
@@ -589,6 +906,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reaction and chat_id is not None:
         photo_path, caption = reaction
         await send_reaction(context.bot, chat_id, photo_path, caption)
+    if notice and chat_id is not None:
+        await context.bot.send_message(
+            chat_id=chat_id, text=notice, parse_mode=ParseMode.HTML
+        )
 
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -624,6 +945,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cmd_week(update, context)
     if lower in ("все", "всё", "all"):
         return await cmd_all(update, context)
+    if lower in ("просрочено", "просроченные", "overdue"):
+        return await cmd_overdue(update, context)
+    if lower in ("стата", "статистика", "stats"):
+        return await cmd_stats(update, context)
 
     parsed = parse_input(text)
     if not parsed:
@@ -728,9 +1053,15 @@ def main():
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("all", cmd_all))
     app.add_handler(CommandHandler("day", cmd_day))
+    app.add_handler(CommandHandler("overdue", cmd_overdue))
+    app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("del", cmd_del))
     app.add_handler(CommandHandler("prio", cmd_prio))
+    app.add_handler(CommandHandler("edit", cmd_edit))
+    app.add_handler(CommandHandler("snooze", cmd_snooze))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
