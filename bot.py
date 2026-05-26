@@ -13,6 +13,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
     MessageHandler,
     filters,
 )
@@ -59,7 +60,12 @@ def db_init():
             );
             CREATE INDEX IF NOT EXISTS idx_user_date ON tasks(user_id, task_date);
             CREATE INDEX IF NOT EXISTS idx_remind ON tasks(remind_at);
-            """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                morning_time TEXT
+            );
+"""
         )
         cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
         if "priority" not in cols:
@@ -214,6 +220,41 @@ def db_count_done(user_id):
         ).fetchone()[0]
 
 
+def db_update_remind(task_id, user_id, remind_at):
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET remind_at = ? WHERE id = ? AND user_id = ?",
+            (remind_at.isoformat() if remind_at else None, task_id, user_id),
+        )
+
+
+def db_get_morning(user_id):
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT user_id, chat_id, morning_time FROM user_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def db_set_morning(user_id, chat_id, hhmm):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO user_settings(user_id, chat_id, morning_time) "
+            "VALUES(?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "chat_id = excluded.chat_id, morning_time = excluded.morning_time",
+            (user_id, chat_id, hhmm),
+        )
+
+
+def db_all_morning():
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT user_id, chat_id, morning_time FROM user_settings "
+            "WHERE morning_time IS NOT NULL"
+        ).fetchall()
+
+
 def db_stats(user_id):
     today = datetime.now(TZ).date()
     tom = today + timedelta(days=1)
@@ -294,6 +335,16 @@ def parse_date_only(s: str):
 
 PRIO_ICONS = {0: "▫️", 1: "🟡", 2: "🔴"}
 PRIO_NAMES = {0: "обычная", 1: "важно", 2: "срочно"}
+
+
+def parse_hhmm(s: str):
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s.strip())
+    if not m:
+        return None
+    try:
+        return dtime(int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None
 
 
 def compute_snooze_date(row, arg=None):
@@ -567,8 +618,13 @@ HELP = (
     "/snooze 12 — на завтра (или сегодня, если просрочено)\n"
     "/snooze 12 +3 — через 3 дня\n"
     "/snooze 12 25.05 — на конкретную дату\n"
+    "/remind 12 18:00 — поставить/изменить напоминание · /remind 12 off — снять\n"
     "/del 12 — удалить задачу #12\n"
-    "/clear — удалить все выполненные (с подтверждением)\n"
+    "/clear — удалить все выполненные (с подтверждением)\n\n"
+    "<b>Уведомления:</b>\n"
+    "/morning 09:00 — присылать план на день каждое утро\n"
+    "/morning off — выключить · /morning — узнать текущее время\n"
+    "Когда сработает напоминание — кнопки: ⏰ +15м · ⏰ +1ч · ⏰ +1д (отложить).\n\n"
     "/help — эта подсказка\n\n"
     "Под списком кнопки: ✅/↩️ (готово/вернуть) · 🟡/🔴 (циклить приоритет) · ⏭ (отложить на день) · 🗑 (удалить)."
 )
@@ -730,6 +786,95 @@ async def cmd_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /remind 12 18:00\n"
+            "или /remind 12 off — снять напоминание"
+        )
+        return
+    try:
+        tid = int(context.args[0].lstrip("#"))
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом")
+        return
+    row = db_get_task(tid, update.effective_user.id)
+    if not row:
+        await update.message.reply_text("Такой задачи нет")
+        return
+    arg = " ".join(context.args[1:]).strip().lower()
+    for j in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
+        j.schedule_removal()
+    if arg in ("off", "выкл", "выключить", "0", "no", "нет"):
+        db_update_remind(tid, update.effective_user.id, None)
+        await update.message.reply_html(f"⏰ Снял напоминание с <b>#{tid}</b>.")
+        return
+    t = parse_hhmm(arg)
+    if not t:
+        await update.message.reply_text(
+            "Не понял время. Пример: /remind 12 18:00 или /remind 12 off"
+        )
+        return
+    task_date = date.fromisoformat(row["task_date"])
+    new_remind = datetime.combine(task_date, t, tzinfo=TZ)
+    now = datetime.now(TZ)
+    if new_remind <= now:
+        await update.message.reply_text(
+            "Это время уже прошло. Сначала /snooze задачу или поставь будущее время."
+        )
+        return
+    db_update_remind(tid, update.effective_user.id, new_remind)
+    context.job_queue.run_once(
+        send_reminder,
+        when=(new_remind - now).total_seconds(),
+        chat_id=row["chat_id"],
+        user_id=row["user_id"],
+        name=f"remind:{tid}",
+        data={"task_id": tid},
+    )
+    await update.message.reply_html(
+        f"⏰ Напомню по <b>#{tid}</b> в <b>{new_remind.strftime('%H:%M')}</b> "
+        f"({fmt_date(task_date)}):\n<i>{row['text']}</i>"
+    )
+
+
+async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    if not context.args:
+        cur = db_get_morning(user_id)
+        if cur and cur["morning_time"]:
+            await update.message.reply_html(
+                f"🌅 Утренний дайджест включён на <b>{cur['morning_time']}</b>.\n"
+                f"Выключить: /morning off · Сменить время: /morning 08:30"
+            )
+        else:
+            await update.message.reply_text(
+                "Утренний дайджест выключен.\n"
+                "Включить: /morning 09:00"
+            )
+        return
+    arg = context.args[0].strip().lower()
+    if arg in ("off", "выкл", "выключить", "0", "no", "нет"):
+        for j in context.job_queue.get_jobs_by_name(f"morning:{user_id}"):
+            j.schedule_removal()
+        db_set_morning(user_id, chat_id, None)
+        await update.message.reply_text("🌅 Утренний дайджест выключен.")
+        return
+    t = parse_hhmm(arg)
+    if not t:
+        await update.message.reply_text(
+            "Использование: /morning 09:00 или /morning off"
+        )
+        return
+    hhmm = f"{t.hour:02d}:{t.minute:02d}"
+    db_set_morning(user_id, chat_id, hhmm)
+    schedule_morning(context, user_id, chat_id, hhmm)
+    await update.message.reply_html(
+        f"🌅 Буду присылать список дел каждое утро в <b>{hhmm}</b>."
+    )
+
+
 async def cmd_clear(update: Update, _: ContextTypes.DEFAULT_TYPE):
     n = db_count_done(update.effective_user.id)
     if n == 0:
@@ -858,6 +1003,42 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         return
 
+    # rsnz: snooze the reminder itself by N minutes (third part is minutes, not a view)
+    if action == "rsnz":
+        try:
+            minutes = int(view)
+        except ValueError:
+            return
+        row = db_get_task(tid, user_id)
+        if not row:
+            return
+        now = datetime.now(TZ)
+        new_remind = now + timedelta(minutes=minutes)
+        cur_date = date.fromisoformat(row["task_date"])
+        new_date = max(cur_date, new_remind.date())
+        db_update_schedule(tid, user_id, new_date, new_remind)
+        for j in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
+            j.schedule_removal()
+        context.job_queue.run_once(
+            send_reminder,
+            when=(new_remind - now).total_seconds(),
+            chat_id=row["chat_id"],
+            user_id=row["user_id"],
+            name=f"remind:{tid}",
+            data={"task_id": tid},
+        )
+        when_label = new_remind.strftime("%H:%M")
+        if new_date != date.fromisoformat(row["task_date"]) or new_date != now.date():
+            when_label = f"{fmt_date(new_date)} в {when_label}"
+        try:
+            await q.edit_message_text(
+                f"⏰ Перенёс на <b>{when_label}</b>:\n<i>{row['text']}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            log.debug("edit_message_text failed: %s", e)
+        return
+
     reaction = None  # (photo_path, caption) to send after refresh
     notice = None  # plain text to send as separate message
 
@@ -926,11 +1107,61 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         chat_id=job.chat_id,
         text=f"⏰ Напоминание <b>#{row['id']}</b>\n<i>{row['text']}</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Готово", callback_data=f"done:{row['id']}:t"),
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{row['id']}:t"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⏰ +15м", callback_data=f"rsnz:{row['id']}:15"),
+                InlineKeyboardButton("⏰ +1ч", callback_data=f"rsnz:{row['id']}:60"),
+                InlineKeyboardButton("⏰ +1д", callback_data=f"rsnz:{row['id']}:1440"),
+            ],
+            [
+                InlineKeyboardButton("✅ Готово", callback_data=f"done:{row['id']}:t"),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{row['id']}:t"),
+            ],
+        ]),
     )
+
+
+async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    data = job.data or {}
+    user_id = data.get("user_id")
+    if user_id is None:
+        return
+    today = datetime.now(TZ).date()
+    rows = db_list_tasks(user_id, day=today)
+    if not rows:
+        await context.bot.send_message(
+            chat_id=job.chat_id,
+            text="<b>🌅 Доброе утро!</b>\nСегодня дел нет — отдыхай 🙂",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    text = render_tasks(rows, "🌅 Доброе утро! План на сегодня")
+    kb = tasks_keyboard(rows, "t")
+    await context.bot.send_message(
+        chat_id=job.chat_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+def schedule_morning(app, user_id, chat_id, hhmm_str):
+    job_name = f"morning:{user_id}"
+    for j in app.job_queue.get_jobs_by_name(job_name):
+        j.schedule_removal()
+    t = parse_hhmm(hhmm_str)
+    if not t:
+        return False
+    app.job_queue.run_daily(
+        send_morning_digest,
+        time=t.replace(tzinfo=TZ),
+        chat_id=chat_id,
+        user_id=user_id,
+        name=job_name,
+        data={"user_id": user_id},
+    )
+    return True
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1031,6 +1262,12 @@ async def restore_reminders(app: Application):
         restored += 1
     log.info("Restored %d pending reminders (of %d on disk)", restored, len(rows))
 
+    morning_n = 0
+    for s in db_all_morning():
+        if schedule_morning(app, s["user_id"], s["chat_id"], s["morning_time"]):
+            morning_n += 1
+    log.info("Scheduled %d morning digests", morning_n)
+
 
 def main():
     if not TOKEN:
@@ -1043,6 +1280,7 @@ def main():
     app = (
         Application.builder()
         .token(TOKEN)
+        .defaults(Defaults(tzinfo=TZ))
         .post_init(restore_reminders)
         .build()
     )
@@ -1061,6 +1299,8 @@ def main():
     app.add_handler(CommandHandler("prio", cmd_prio))
     app.add_handler(CommandHandler("edit", cmd_edit))
     app.add_handler(CommandHandler("snooze", cmd_snooze))
+    app.add_handler(CommandHandler("remind", cmd_remind))
+    app.add_handler(CommandHandler("morning", cmd_morning))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
