@@ -733,9 +733,35 @@ def tasks_keyboard(rows, view: str):
     return InlineKeyboardMarkup(kb) if kb else None
 
 
+def progress_bar(done: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return ""
+    filled = round(width * done / total)
+    filled = max(0, min(width, filled))
+    pct = round(100 * done / total)
+    return f"{'█' * filled}{'░' * (width - filled)} {pct}%"
+
+
+EMPTY_HINTS = {
+    "Сегодня": "Сегодня ничего не запланировано 🌿\nДобавь задачу, например: <code>сегодня позвонить маме</code>",
+    "Завтра": "На завтра пока пусто. Можешь спланировать заранее:\n<code>завтра 09:00 пробежка</code>",
+    "Неделя": "На ближайшую неделю ничего нет. Самое время добавить планы 📝",
+    "Просрочено": "Просроченных задач нет — красота! 🎉",
+    "Матрица": "В матрице пусто. Добавь первую задачу 🙂",
+    "Поиск": "По этому слову ничего не нашёл.",
+}
+
+
+def empty_hint(header: str) -> str:
+    for key, hint in EMPTY_HINTS.items():
+        if key.lower() in header.lower():
+            return hint
+    return "Пусто. Можно отдохнуть 🙂"
+
+
 def render_tasks(rows, header: str) -> str:
     if not rows:
-        return f"<b>{header}</b>\n\nПусто. Можно отдохнуть 🙂"
+        return f"<b>{header}</b>\n\n{empty_hint(header)}"
     out = [f"<b>{header}</b>"]
     cur_date = None
     for r in rows:
@@ -745,7 +771,8 @@ def render_tasks(rows, header: str) -> str:
             cur_date = d
         out.append(task_line(r))
     done = sum(1 for r in rows if r["done"])
-    out.append(f"\n— Сделано: {done} из {len(rows)} —")
+    bar = progress_bar(done, len(rows))
+    out.append(f"\n<code>{bar}</code>  ·  {done}/{len(rows)}")
     return "\n".join(out)
 
 
@@ -765,7 +792,8 @@ def render_matrix(rows) -> str:
     out = ["<b>📊 Матрица Эйзенхауэра</b>"]
     for p, title, hint in MATRIX_SECTIONS:
         items = groups.get(p, [])
-        out.append(f"\n<b>{title}</b> · <i>{hint}</i>")
+        count_badge = f" · <b>{len(items)}</b>" if items else ""
+        out.append(f"\n<b>{title}</b>{count_badge} · <i>{hint}</i>")
         if not items:
             out.append("  — пусто")
             continue
@@ -794,7 +822,11 @@ def view_for(user_id, view_code: str):
     """Return (rows, header) for a callback view code."""
     if view_code == "t":
         d = datetime.now(TZ).date()
-        return db_list_tasks(user_id, day=d), f"Дела на {fmt_date(d)}"
+        header = f"Дела на {fmt_date(d)}"
+        overdue_n = len(db_list_overdue(user_id))
+        if overdue_n:
+            header += f"  ·  ⚠️ просрочено: {overdue_n}"
+        return db_list_tasks(user_id, day=d), header
     if view_code == "tm":
         d = datetime.now(TZ).date() + timedelta(days=1)
         return db_list_tasks(user_id, day=d), f"Дела на {fmt_date(d)}"
@@ -983,20 +1015,19 @@ async def cmd_stats(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if s["total"] == 0:
         await update.message.reply_text("Пока ничего нет. Добавь первую задачу 🙂")
         return
-    pct = round(100 * s["done"] / s["total"]) if s["total"] else 0
+    bar = progress_bar(s["done"], s["total"], width=14)
     text = (
-        f"<b>📊 Статистика</b>\n\n"
-        f"Всего задач: <b>{s['total']}</b>\n"
-        f"✅ Сделано: <b>{s['done']}</b> ({pct}%)\n"
-        f"📝 В работе: <b>{s['pending']}</b>\n\n"
-        f"<b>Среди невыполненных:</b>\n"
-        f"⚠️ Просрочено: <b>{s['overdue']}</b>\n"
-        f"📅 На сегодня: <b>{s['today']}</b>\n"
-        f"📅 На завтра: <b>{s['tomorrow']}</b>\n\n"
-        f"<b>По приоритету (в работе):</b>\n"
-        f"🔴 Срочно: <b>{s['urgent']}</b>\n"
-        f"🟡 Важно: <b>{s['important']}</b>\n"
-        f"▫️ Обычные: <b>{s['normal']}</b>"
+        f"<b>📈 Статистика</b>\n\n"
+        f"<code>{bar}</code>\n"
+        f"✅ <b>{s['done']}</b> сделано  ·  📝 <b>{s['pending']}</b> в работе  ·  всего <b>{s['total']}</b>\n\n"
+        f"<b>🗂 Расклад по срокам</b>\n"
+        f"  ⚠️ Просрочено: <b>{s['overdue']}</b>\n"
+        f"  📅 На сегодня: <b>{s['today']}</b>\n"
+        f"  📆 На завтра: <b>{s['tomorrow']}</b>\n\n"
+        f"<b>🎯 По приоритету (в работе)</b>\n"
+        f"  🔴 Сделать сейчас: <b>{s['urgent']}</b>\n"
+        f"  🟡 Запланировать:  <b>{s['important']}</b>\n"
+        f"  ▫️ Обычные:        <b>{s['normal']}</b>"
     )
     await update.message.reply_html(text)
 
@@ -1470,15 +1501,24 @@ async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
         return
     today = datetime.now(TZ).date()
     rows = db_list_tasks(user_id, day=today)
-    if not rows:
+    overdue = db_list_overdue(user_id)
+    if not rows and not overdue:
         await context.bot.send_message(
             chat_id=job.chat_id,
             text="<b>🌅 Доброе утро!</b>\nСегодня дел нет — отдыхай 🙂",
             parse_mode=ParseMode.HTML,
         )
         return
-    text = render_tasks(rows, "🌅 Доброе утро! План на сегодня")
-    kb = tasks_keyboard(rows, "t")
+    if not rows:
+        header = "🌅 Доброе утро! На сегодня пусто, но есть хвосты:"
+        text = render_tasks(overdue, header)
+        kb = tasks_keyboard(overdue, "o")
+    else:
+        header = "🌅 Доброе утро! План на сегодня"
+        if overdue:
+            header += f"  ·  ⚠️ просрочено: {len(overdue)}"
+        text = render_tasks(rows, header)
+        kb = tasks_keyboard(rows, "t")
     await context.bot.send_message(
         chat_id=job.chat_id,
         text=text,
