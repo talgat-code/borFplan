@@ -2,10 +2,11 @@ __pycache__/
 *.py[cod]
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.log
 .env
 .venv/
 venv/
 .idea/
-.vscode/
 .DS_Store
