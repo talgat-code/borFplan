@@ -2,5 +2,10 @@ __pycache__/
 *.py[cod]
 *.db
 *.db-journal
+*.log
 .env
 .venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
