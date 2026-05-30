@@ -27,9 +27,7 @@ from telegram.ext import (
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "planbot.db"
 MEDIA_DIR = BASE_DIR / "media"
-PHOTO_ADD = MEDIA_DIR / "add.jpg"
 PHOTO_DONE = MEDIA_DIR / "done.jpg"
-PHOTO_DELETE = MEDIA_DIR / "delete.jpg"
 TZ_NAME = os.environ.get("PLANBOT_TZ", "Asia/Almaty")
 TZ = ZoneInfo(TZ_NAME)
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -1283,11 +1281,11 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not was_done:
         await send_reaction(
             context.bot, update.effective_chat.id, PHOTO_DONE,
-            f"<b>Молодец!</b> 💪\nЗадача <b>#{tid}</b> выполнена:\n<i>{row['text']}</i>",
+            f"<b>Готово!</b>\n<b>#{tid}</b> <i>{row['text']}</i>",
         )
     else:
         await update.message.reply_html(
-            f"Вернул #{tid} в работу:\n<i>{row['text']}</i>"
+            f"↩️ Вернул <b>#{tid}</b> в работу:\n<i>{row['text']}</i>"
         )
 
 
@@ -1344,9 +1342,8 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
         job.schedule_removal()
     if row:
-        await send_reaction(
-            context.bot, update.effective_chat.id, PHOTO_DELETE,
-            f"<b>ОКЕЙ</b>\nУдалил <b>#{tid}</b>:\n<i>{row['text']}</i>",
+        await update.message.reply_html(
+            f"🗑 Удалил <b>#{tid}</b>:\n<i>{row['text']}</i>"
         )
     else:
         await update.message.reply_text(f"Удалил #{tid}")
@@ -1470,7 +1467,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not was_done and chat_id is not None:
                 reaction = (
                     PHOTO_DONE,
-                    f"<b>Молодец!</b> 💪\nЗадача <b>#{tid}</b> выполнена:\n<i>{row['text']}</i>",
+                    f"<b>Готово!</b>\n<b>#{tid}</b> <i>{row['text']}</i>",
                 )
     elif action == "del":
         row = db_get_task(tid, user_id)
@@ -1478,10 +1475,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
             job.schedule_removal()
         if row and chat_id is not None:
-            reaction = (
-                PHOTO_DELETE,
-                f"<b>ОКЕЙ</b>\nУдалил <b>#{tid}</b>:\n<i>{row['text']}</i>",
-            )
+            notice = f"🗑 Удалил <b>#{tid}</b>: <i>{row['text']}</i>"
     elif action == "prio":
         row = db_get_task(tid, user_id)
         if row:
@@ -1676,11 +1670,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prio_label = ""
     if prio:
         prio_label = f" {PRIO_ICONS[prio]} <i>({PRIO_NAMES[prio]})</i>"
-    caption = (
-        f"<b>Умничка!</b> 🎉\n"
-        f"Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{txt}</i>{tail}"
+    await update.message.reply_html(
+        f"✅ Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{txt}</i>{tail}"
     )
-    await send_reaction(context.bot, update.effective_chat.id, PHOTO_ADD, caption)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
