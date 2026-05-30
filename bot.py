@@ -687,24 +687,52 @@ def fmt_date(d: date) -> str:
     return f"{d.strftime('%d.%m.%Y')} ({label})"
 
 
-def task_line(row) -> str:
+def task_line(row, show_date: bool = False) -> str:
+    text = row["text"]
     if row["done"]:
         mark = "✅"
+        body = f"<s>{text}</s>"
     else:
         mark = PRIO_ICONS.get(row["priority"], "▫️")
+        body = text
     suffix = ""
     if row["remind_at"]:
         try:
             ra = datetime.fromisoformat(row["remind_at"])
-            suffix = f" ⏰ {ra.strftime('%H:%M')}"
+            suffix += f" ⏰ {ra.strftime('%H:%M')}"
         except ValueError:
             pass
-    return f"{mark} <b>#{row['id']}</b> {row['text']}{suffix}"
+    if show_date:
+        try:
+            d = date.fromisoformat(row["task_date"])
+            suffix += f" <i>· {d.strftime('%d.%m')}</i>"
+        except ValueError:
+            pass
+    return f"{mark} <b>#{row['id']}</b> {body}{suffix}"
+
+
+NAV_VIEWS = [
+    ("t", "📅 Сегодня"),
+    ("tm", "📆 Завтра"),
+    ("w", "🗓 Неделя"),
+    ("m", "📊 Матрица"),
+]
+
+
+def nav_row(current_view: str):
+    """Inline buttons to jump between Today/Tomorrow/Week/Matrix without typing.
+    The button for the current view is omitted."""
+    return [
+        InlineKeyboardButton(label, callback_data=f"nav:{code}")
+        for code, label in NAV_VIEWS
+        if code != current_view
+    ]
 
 
 def tasks_keyboard(rows, view: str):
     """Compact per-task buttons. Default: ✅/↩️ + 🗑 (two buttons).
-    Matrix view also gets the priority-cycle button."""
+    Matrix view also gets the priority-cycle button.
+    Always ends with a nav row for quick view switching."""
     kb = []
     for r in rows:
         flip = "↩️" if r["done"] else "✅"
@@ -729,6 +757,9 @@ def tasks_keyboard(rows, view: str):
             )
         )
         kb.append(row_btns)
+    nav = nav_row(view)
+    if nav:
+        kb.append(nav)
     return InlineKeyboardMarkup(kb) if kb else None
 
 
@@ -761,17 +792,24 @@ def empty_hint(header: str) -> str:
 def render_tasks(rows, header: str) -> str:
     if not rows:
         return f"<b>{header}</b>\n\n{empty_hint(header)}"
+    pending = [r for r in rows if not r["done"]]
+    done_rows = [r for r in rows if r["done"]]
     out = [f"<b>{header}</b>"]
     cur_date = None
-    for r in rows:
+    for r in pending:
         d = date.fromisoformat(r["task_date"])
         if d != cur_date:
             out.append(f"\n📅 <i>{fmt_date(d)}</i>")
             cur_date = d
         out.append(task_line(r))
-    done = sum(1 for r in rows if r["done"])
-    bar = progress_bar(done, len(rows))
-    out.append(f"\n<code>{bar}</code>  ·  {done}/{len(rows)}")
+    if done_rows:
+        out.append(f"\n<i>─ Выполнено ({len(done_rows)}) ─</i>")
+        for r in done_rows:
+            out.append(task_line(r, show_date=True))
+    done_n = len(done_rows)
+    total = len(rows)
+    bar = progress_bar(done_n, total)
+    out.append(f"\n<code>{bar}</code>  ·  {done_n}/{total}")
     return "\n".join(out)
 
 
@@ -1358,6 +1396,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Отменено. Ничего не удалил.")
         except Exception as e:
             log.debug("edit_message_text failed: %s", e)
+        return
+
+    if data.startswith("nav:"):
+        target = data[4:]
+        if target == "m":
+            rows = db_list_matrix(user_id)
+            text = render_matrix(rows)
+            kb = tasks_keyboard(rows, "m")
+        else:
+            rows, header = view_for(user_id, target)
+            text = render_tasks(rows, header)
+            kb = tasks_keyboard(rows, target)
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e:
+            log.debug("nav switch failed: %s", e)
         return
 
     parts = data.split(":", 2)
