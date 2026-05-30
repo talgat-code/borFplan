@@ -46,9 +46,7 @@ log = logging.getLogger("planbot")
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["📅 Сегодня", "📆 Завтра"],
-        ["🗓 Неделя", "📊 Матрица"],
-        ["⚠️ Просрочено", "📈 Стата"],
-        ["❓ Помощь"],
+        ["🗓 Неделя", "❓ Помощь"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -79,8 +77,11 @@ BOT_COMMANDS = [
 # ---------- DB ----------
 
 def db_connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -702,25 +703,23 @@ def task_line(row) -> str:
 
 
 def tasks_keyboard(rows, view: str):
+    """Compact per-task buttons. Default: ✅/↩️ + 🗑 (two buttons).
+    Matrix view also gets the priority-cycle button."""
     kb = []
     for r in rows:
         flip = "↩️" if r["done"] else "✅"
-        prio_icon = PRIO_ICONS.get(r["priority"], "▫️")
         row_btns = [
             InlineKeyboardButton(
                 f"{flip} #{r['id']}",
                 callback_data=f"done:{r['id']}:{view}",
             ),
-            InlineKeyboardButton(
-                f"{prio_icon} #{r['id']}",
-                callback_data=f"prio:{r['id']}:{view}",
-            ),
         ]
-        if not r["done"]:
+        if view == "m":
+            prio_icon = PRIO_ICONS.get(r["priority"], "▫️")
             row_btns.append(
                 InlineKeyboardButton(
-                    f"⏭ #{r['id']}",
-                    callback_data=f"snz:{r['id']}:{view}",
+                    f"{prio_icon} #{r['id']}",
+                    callback_data=f"prio:{r['id']}:{view}",
                 )
             )
         row_btns.append(
@@ -855,8 +854,8 @@ WELCOME = (
     "• <code>через 30 минут выпить воды</code> — напомню через 30 мин\n"
     "• <code>пт !! сдать отчёт</code> — в пятницу, срочно+важно\n"
     "• <code>вечером ужин</code> — сегодня в 19:00\n\n"
-    "Внизу — быстрые кнопки (📅 Сегодня · 📆 Завтра · 🗓 Неделя · 📊 Матрица…).\n"
-    "Рядом со скрепкой есть кнопка «☰» — там список всех команд.\n\n"
+    "Внизу — быстрые кнопки: 📅 Сегодня · 📆 Завтра · 🗓 Неделя · ❓ Помощь.\n"
+    "Рядом со скрепкой есть кнопка «☰» — там матрица, статистика и остальное.\n\n"
     "Подробная справка: /help"
 )
 
@@ -918,9 +917,9 @@ HELP = (
     "━━━━━━━━━━━━━━━━━━━━\n"
     "✏️ <b>5. Кнопки под каждой задачей</b>\n"
     "✅/↩️ — сделано / вернуть в работу\n"
-    "🟡 🔴 🟣 ▫️ — циклить квадрант приоритета\n"
-    "⏭ — отложить на день\n"
-    "🗑 — удалить\n\n"
+    "🗑 — удалить\n"
+    "В матрице есть ещё 🟡 🔴 🟣 ▫️ — циклить квадрант приоритета.\n"
+    "Отложить — командой <code>/snooze 12</code> (см. ниже).\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "⚙️ <b>6. Команды для конкретной задачи</b>\n"
     "<code>/done 12</code> — переключить «сделано»\n"
@@ -1630,6 +1629,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_reaction(context.bot, update.effective_chat.id, PHOTO_ADD, caption)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error in handler", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Что-то пошло не так. Попробуй ещё раз через минуту."
+            )
+        except Exception as e:
+            log.debug("error-reply failed: %s", e)
+
+
 async def post_init(app: Application):
     try:
         await app.bot.set_my_commands([BotCommand(*c) for c in BOT_COMMANDS])
@@ -1642,6 +1652,7 @@ async def restore_reminders(app: Application):
     rows = db_pending_reminders()
     now = datetime.now(TZ)
     restored = 0
+    missed = 0
     for r in rows:
         try:
             ra = datetime.fromisoformat(r["remind_at"])
@@ -1651,7 +1662,9 @@ async def restore_reminders(app: Application):
             ra = ra.replace(tzinfo=TZ)
         delay = (ra - now).total_seconds()
         if delay <= 0:
-            continue
+            # Bot was offline when reminder was due — fire it shortly after startup.
+            delay = 5
+            missed += 1
         app.job_queue.run_once(
             send_reminder,
             when=delay,
@@ -1661,7 +1674,10 @@ async def restore_reminders(app: Application):
             data={"task_id": r["id"]},
         )
         restored += 1
-    log.info("Restored %d pending reminders (of %d on disk)", restored, len(rows))
+    log.info(
+        "Restored %d reminders (%d missed will fire shortly) of %d on disk",
+        restored, missed, len(rows),
+    )
 
     morning_n = 0
     for s in db_all_morning():
@@ -1707,6 +1723,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     log.info("Starting bot... TZ=%s", TZ_NAME)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
