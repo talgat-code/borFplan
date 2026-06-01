@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 from datetime import date, datetime, timedelta, time as dtime
+from html import escape as _html_escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,12 +26,44 @@ from telegram.ext import (
 )
 
 BASE_DIR = Path(__file__).parent
+
+
+def load_dotenv(path: Path):
+    """Load KEY=VALUE pairs from a .env file into os.environ (no overwrite).
+
+    Tiny zero-dependency loader so the documented `.env` workflow just works.
+    Existing environment variables always win over the file.
+    """
+    if not path.exists():
+        return
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except OSError as e:
+        log_msg = f"could not read {path}: {e}"
+        logging.getLogger("planbot").warning(log_msg)
+
+
+load_dotenv(BASE_DIR / ".env")
+
 DB_PATH = BASE_DIR / "planbot.db"
 MEDIA_DIR = BASE_DIR / "media"
 PHOTO_DONE = MEDIA_DIR / "done.jpg"
 TZ_NAME = os.environ.get("PLANBOT_TZ", "Asia/Almaty")
 TZ = ZoneInfo(TZ_NAME)
 TOKEN = os.environ.get("BOT_TOKEN")
+
+
+def esc(s) -> str:
+    """Escape user-supplied text for safe inclusion in ParseMode.HTML messages."""
+    return _html_escape(str(s), quote=False)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -686,7 +719,7 @@ def fmt_date(d: date) -> str:
 
 
 def task_line(row, show_date: bool = False) -> str:
-    text = row["text"]
+    text = esc(row["text"])
     if row["done"]:
         mark = "✅"
         body = f"<s>{text}</s>"
@@ -844,7 +877,7 @@ def render_matrix(rows) -> str:
                     pass
             out.append(
                 f"  <b>#{r['id']}</b> <i>{overdue_mark}{fmt_date(d)}{time_mark}</i>\n"
-                f"     {r['text']}"
+                f"     {esc(r['text'])}"
             )
     out.append(f"\n— Всего в работе: {len(rows)} —")
     out.append(
@@ -1038,7 +1071,7 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Использование: /find слово")
         return
     rows = db_search(update.effective_user.id, term)
-    header = f"Найдено по «{term}»: {len(rows)}"
+    header = f"Найдено по «{esc(term)}»: {len(rows)}"
     await update.message.reply_html(
         render_tasks(rows, header),
         reply_markup=tasks_keyboard(rows, "a"),
@@ -1095,7 +1128,7 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         db_update_text(tid, update.effective_user.id, cleaned)
     await update.message.reply_html(
-        f"Обновил <b>#{tid}</b>:\n<i>{cleaned}</i>"
+        f"Обновил <b>#{tid}</b>:\n<i>{esc(cleaned)}</i>"
     )
 
 
@@ -1131,7 +1164,7 @@ async def cmd_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tail = "\n⚠️ Время напоминания уже прошло — не ставлю."
     await update.message.reply_html(
         f"Отложил <b>#{tid}</b> на <b>{fmt_date(new_date)}</b>:\n"
-        f"<i>{row['text']}</i>{tail}"
+        f"<i>{esc(row['text'])}</i>{tail}"
     )
 
 
@@ -1183,7 +1216,7 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_html(
         f"⏰ Напомню по <b>#{tid}</b> в <b>{new_remind.strftime('%H:%M')}</b> "
-        f"({fmt_date(task_date)}):\n<i>{row['text']}</i>"
+        f"({fmt_date(task_date)}):\n<i>{esc(row['text'])}</i>"
     )
 
 
@@ -1281,11 +1314,11 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not was_done:
         await send_reaction(
             context.bot, update.effective_chat.id, PHOTO_DONE,
-            f"<b>Готово!</b>\n<b>#{tid}</b> <i>{row['text']}</i>",
+            f"<b>Готово!</b>\n<b>#{tid}</b> <i>{esc(row['text'])}</i>",
         )
     else:
         await update.message.reply_html(
-            f"↩️ Вернул <b>#{tid}</b> в работу:\n<i>{row['text']}</i>"
+            f"↩️ Вернул <b>#{tid}</b> в работу:\n<i>{esc(row['text'])}</i>"
         )
 
 
@@ -1343,7 +1376,7 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job.schedule_removal()
     if row:
         await update.message.reply_html(
-            f"🗑 Удалил <b>#{tid}</b>:\n<i>{row['text']}</i>"
+            f"🗑 Удалил <b>#{tid}</b>:\n<i>{esc(row['text'])}</i>"
         )
     else:
         await update.message.reply_text(f"Удалил #{tid}")
@@ -1449,7 +1482,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             when_label = f"{fmt_date(new_date)} в {when_label}"
         try:
             await q.edit_message_text(
-                f"⏰ Перенёс на <b>{when_label}</b>:\n<i>{row['text']}</i>",
+                f"⏰ Перенёс на <b>{when_label}</b>:\n<i>{esc(row['text'])}</i>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -1467,7 +1500,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not was_done and chat_id is not None:
                 reaction = (
                     PHOTO_DONE,
-                    f"<b>Готово!</b>\n<b>#{tid}</b> <i>{row['text']}</i>",
+                    f"<b>Готово!</b>\n<b>#{tid}</b> <i>{esc(row['text'])}</i>",
                 )
     elif action == "del":
         row = db_get_task(tid, user_id)
@@ -1475,7 +1508,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for job in context.job_queue.get_jobs_by_name(f"remind:{tid}"):
             job.schedule_removal()
         if row and chat_id is not None:
-            notice = f"🗑 Удалил <b>#{tid}</b>: <i>{row['text']}</i>"
+            notice = f"🗑 Удалил <b>#{tid}</b>: <i>{esc(row['text'])}</i>"
     elif action == "prio":
         row = db_get_task(tid, user_id)
         if row:
@@ -1524,7 +1557,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_message(
         chat_id=job.chat_id,
-        text=f"⏰ Напоминание <b>#{row['id']}</b>\n<i>{row['text']}</i>",
+        text=f"⏰ Напоминание <b>#{row['id']}</b>\n<i>{esc(row['text'])}</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [
@@ -1671,7 +1704,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if prio:
         prio_label = f" {PRIO_ICONS[prio]} <i>({PRIO_NAMES[prio]})</i>"
     await update.message.reply_html(
-        f"✅ Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{txt}</i>{tail}"
+        f"✅ Добавил <b>#{tid}</b>{prio_label} на <b>{when}</b>:\n<i>{esc(txt)}</i>{tail}"
     )
 
 
